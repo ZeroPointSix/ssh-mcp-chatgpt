@@ -465,11 +465,60 @@ function schema(properties: JsonObject, required: string[] = []): JsonObject {
   };
 }
 
+const HEALTH_OUTPUT_SCHEMA: JsonObject = {
+  type: "object",
+  properties: {
+    status: { type: "string", enum: ["ok"] },
+    name: { type: "string" },
+    version: { type: "string" },
+    transports: { type: "array", items: { type: "string" } },
+    endpoints: { type: "array", items: { type: "string" } },
+    oauth_enabled: { type: "boolean" },
+    static_bearer_enabled: { type: "boolean" },
+    sudo_enabled: { type: "boolean" },
+    audit_log_enabled: { type: "boolean" },
+    note_required: { type: "boolean" },
+    max_command_chars: { anyOf: [{ type: "number" }, { type: "string", enum: ["none"] }] },
+    ssh_target_configured: { type: "boolean" },
+  },
+  required: [
+    "status",
+    "name",
+    "version",
+    "transports",
+    "endpoints",
+    "oauth_enabled",
+    "static_bearer_enabled",
+    "sudo_enabled",
+    "audit_log_enabled",
+    "note_required",
+    "max_command_chars",
+    "ssh_target_configured",
+  ],
+  additionalProperties: false,
+};
+
+const COMMAND_OUTPUT_SCHEMA: JsonObject = {
+  type: "object",
+  properties: {
+    status: { type: "string", enum: ["completed", "failed"] },
+    tool: { type: "string", enum: ["exec", "sudo-exec"] },
+    stdout: { type: "string" },
+    command_length: { type: "number" },
+    error: { type: "string" },
+    code: { type: "string" },
+  },
+  required: ["status"],
+  additionalProperties: false,
+};
+
 function withSecurity(tool: JsonObject, securitySchemes: JsonObject[]): JsonObject {
+  const currentMeta = tool._meta && typeof tool._meta === "object" && !Array.isArray(tool._meta) ? (tool._meta as JsonObject) : {};
   return {
     ...tool,
     securitySchemes,
     _meta: {
+      ...currentMeta,
       securitySchemes,
     },
   };
@@ -485,6 +534,7 @@ function listTools(config: RuntimeConfig): JsonObject[] {
         name: "health",
         description: "Check whether the SSH MCP ChatGPT adapter is online and return non-secret deployment capabilities.",
         inputSchema: schema({}),
+        outputSchema: HEALTH_OUTPUT_SCHEMA,
         annotations: { readOnlyHint: true },
       },
       noAuth,
@@ -493,7 +543,7 @@ function listTools(config: RuntimeConfig): JsonObject[] {
       {
         name: "exec",
         description:
-          "Execute a bounded shell command on the server-side configured SSH target. Credentials and target host are configured by the deployment, not by ChatGPT.",
+          "Execute a bounded shell command on the server-side configured SSH target. Credentials and target host are configured by the deployment, not by ChatGPT. Ask for confirmation before running destructive commands.",
         inputSchema: schema(
           {
             command: { type: "string", minLength: 1, description: "Shell command to execute on the configured SSH target." },
@@ -501,6 +551,11 @@ function listTools(config: RuntimeConfig): JsonObject[] {
           },
           ["command"],
         ),
+        outputSchema: COMMAND_OUTPUT_SCHEMA,
+        _meta: {
+          "openai/toolInvocation/invoking": "Running SSH command",
+          "openai/toolInvocation/invoked": "SSH command finished",
+        },
       },
       protectedSchemes,
     ),
@@ -512,7 +567,7 @@ function listTools(config: RuntimeConfig): JsonObject[] {
         {
           name: "sudo-exec",
           description:
-            "Execute a bounded shell command through sudo on the server-side configured SSH target. Sudo credentials, when needed, are configured server-side.",
+            "Execute a bounded shell command through sudo on the server-side configured SSH target. Sudo credentials, when needed, are configured server-side. Ask for confirmation before running destructive commands.",
           inputSchema: schema(
             {
               command: { type: "string", minLength: 1, description: "Shell command to execute with sudo." },
@@ -520,6 +575,11 @@ function listTools(config: RuntimeConfig): JsonObject[] {
             },
             ["command"],
           ),
+          outputSchema: COMMAND_OUTPUT_SCHEMA,
+          _meta: {
+            "openai/toolInvocation/invoking": "Running sudo command",
+            "openai/toolInvocation/invoked": "Sudo command finished",
+          },
         },
         protectedSchemes,
       ),
@@ -560,7 +620,7 @@ function getOrCreateSessionId(req: IncomingMessage): string {
 function assertStreamableAccept(req: IncomingMessage): void {
   const accept = getHeader(req.headers, "accept")?.toLowerCase() ?? "";
   if (!accept.includes("application/json") || !accept.includes("text/event-stream")) {
-    throw new AppError(406, "Accept must include application/json and text/event-stream", "ACCEPT_NOT_ACCEPTABLE");
+    throw new AppError(406, `Accept must include ${STREAMABLE_HTTP_ACCEPT}`, "ACCEPT_NOT_ACCEPTABLE");
   }
 }
 
