@@ -1,0 +1,9 @@
+node_modules
+build
+coverage
+.git
+.gitignore
+.env
+.env.*
+.ssh-mcp-data
+npm-debug.log*
