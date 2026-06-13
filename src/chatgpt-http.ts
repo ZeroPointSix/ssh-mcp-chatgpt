@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { appendFile, mkdir, readFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { createServer, type IncomingHttpHeaders, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -66,9 +66,83 @@ interface AccessTokenEntry {
   expiresAt: number;
 }
 
+const OAUTH_PREFIX_MARKER = "prefix:";
+
 const clientRegistrations = new Map<string, ClientRegistration>();
 const authCodes = new Map<string, PendingAuthCode>();
 const accessTokens = new Map<string, AccessTokenEntry>();
+
+function oauthPrefixEntry(prefix: string): string {
+  return `${OAUTH_PREFIX_MARKER}${prefix}`;
+}
+
+function oauthMatchesRedirectUri(registration: ClientRegistration, redirectUri: string): boolean {
+  if (registration.redirectUris.has(redirectUri)) return true;
+  for (const entry of registration.redirectUris) {
+    if (entry.startsWith(OAUTH_PREFIX_MARKER) && redirectUri.startsWith(entry.slice(OAUTH_PREFIX_MARKER.length))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function mergeClientRegistration(clientId: string, redirectUris: Iterable<string>): void {
+  const existing = clientRegistrations.get(clientId);
+  const merged = existing ? new Set(existing.redirectUris) : new Set<string>();
+  for (const uri of redirectUris) merged.add(uri);
+  clientRegistrations.set(clientId, { redirectUris: merged });
+}
+
+async function loadOAuthClientRegistrations(dataDir: string): Promise<void> {
+  const filePath = join(dataDir, "oauth-clients.json");
+  try {
+    const raw = await readFile(filePath, "utf8");
+    const parsed = JSON.parse(raw) as { clients?: Record<string, string[]> };
+    for (const [clientId, uris] of Object.entries(parsed.clients ?? {})) {
+      if (Array.isArray(uris) && uris.length > 0) {
+        mergeClientRegistration(clientId, uris);
+      }
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.warn("[oauth] failed to load client registrations:", error);
+    }
+  }
+}
+
+async function persistOAuthClientRegistrations(dataDir: string): Promise<void> {
+  const filePath = join(dataDir, "oauth-clients.json");
+  try {
+    await mkdir(dataDir, { recursive: true });
+    const clients: Record<string, string[]> = {};
+    for (const [clientId, registration] of clientRegistrations) {
+      clients[clientId] = [...registration.redirectUris];
+    }
+    await writeFile(filePath, `${JSON.stringify({ clients }, null, 2)}\n`, "utf8");
+  } catch (error) {
+    console.warn("[oauth] failed to persist client registrations:", error);
+  }
+}
+
+async function bootstrapOAuthClients(config: RuntimeConfig): Promise<void> {
+  if (!config.oauthBaseUrl) return;
+  await loadOAuthClientRegistrations(config.dataDir);
+
+  const bootstrapRaw = process.env.OAUTH_BOOTSTRAP_CLIENT_ID;
+  const bootstrapClientId = bootstrapRaw === "" ? "" : (bootstrapRaw?.trim() || "mcp-client-chatgpt");
+  if (!bootstrapClientId) return;
+
+  const prefixes = parseCsv(getEnv("OAUTH_BOOTSTRAP_REDIRECT_URI_PREFIXES")).length
+    ? parseCsv(getEnv("OAUTH_BOOTSTRAP_REDIRECT_URI_PREFIXES"))
+    : ["https://chatgpt.com/connector/oauth/"];
+  const prefixEntries = prefixes.map((prefix) => oauthPrefixEntry(prefix));
+  const before = new Set(clientRegistrations.get(bootstrapClientId)?.redirectUris ?? []);
+  mergeClientRegistration(bootstrapClientId, prefixEntries);
+  const changed = prefixEntries.some((entry) => !before.has(entry));
+  if (changed) {
+    await persistOAuthClientRegistrations(config.dataDir);
+  }
+}
 
 const cleanupTimer = setInterval(() => {
   const now = Date.now();
@@ -167,11 +241,36 @@ function requestUrl(req: IncomingMessage): URL {
   return new URL(req.url ?? "/", `http://${host}`);
 }
 
+function isLocalHost(host: string): boolean {
+  const hostname = host.split(":")[0]?.replace(/^\[|\]$/g, "").toLowerCase() ?? "";
+  return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1";
+}
+
+function resolvePublicProto(req: IncomingMessage, host: string): string {
+  const forwarded = getHeader(req.headers, "x-forwarded-proto")?.split(",")[0]?.trim().toLowerCase();
+  if (forwarded === "https" || forwarded === "http") return forwarded;
+
+  const cfVisitor = getHeader(req.headers, "cf-visitor");
+  if (cfVisitor?.includes('"scheme":"https"')) return "https";
+
+  const hostname = host.split(":")[0] ?? "";
+  if (!isLocalHost(host) && !/^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostname)) {
+    return "https";
+  }
+  return "http";
+}
+
 function externalBaseUrl(req: IncomingMessage, config: RuntimeConfig): string {
+  const forwardedHost = getHeader(req.headers, "x-forwarded-host")?.split(",")[0]?.trim();
+  const host = forwardedHost || getHeader(req.headers, "host");
+  if (host && !isLocalHost(host)) {
+    const proto = resolvePublicProto(req, host);
+    return `${proto}://${host}`.replace(/\/+$/, "");
+  }
   if (config.oauthBaseUrl) return config.oauthBaseUrl;
-  const host = getHeader(req.headers, "x-forwarded-host") ?? getHeader(req.headers, "host") ?? "127.0.0.1";
+  const fallbackHost = host ?? "127.0.0.1";
   const proto = getHeader(req.headers, "x-forwarded-proto") ?? "http";
-  return `${proto}://${host}`.replace(/\/+$/, "");
+  return `${proto}://${fallbackHost}`.replace(/\/+$/, "");
 }
 
 function randomToken(bytes = 32): string {
@@ -776,7 +875,9 @@ function registeredRedirectUris(value: unknown): { redirectUris: string[]; inval
 }
 
 function isRegisteredRedirectUri(clientId: string, redirectUri: string): boolean {
-  return Boolean(clientRegistrations.get(clientId)?.redirectUris.has(redirectUri));
+  const registration = clientRegistrations.get(clientId);
+  if (!registration) return false;
+  return oauthMatchesRedirectUri(registration, redirectUri);
 }
 
 function escapeHtml(value: string): string {
@@ -830,7 +931,9 @@ async function handleRegister(req: IncomingMessage, res: ServerResponse): Promis
   }
 
   const clientId = `mcp-client-${randomToken(18)}`;
-  clientRegistrations.set(clientId, { redirectUris: new Set(parsed.redirectUris) });
+  mergeClientRegistration(clientId, parsed.redirectUris);
+  const dataDir = getEnv("SSH_MCP_DATA_DIR", "DATA_DIR") ?? ".ssh-mcp-data";
+  await persistOAuthClientRegistrations(dataDir);
   sendJson(res, 200, {
     client_id: clientId,
     client_id_issued_at: Math.floor(Date.now() / 1000),
@@ -848,6 +951,20 @@ function oauthParamsFromUrl(req: IncomingMessage, config: RuntimeConfig): URLSea
   return params;
 }
 
+function authorizeHelpHtml(baseUrl: string, message: string): string {
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>SSH MCP OAuth</title>
+<style>body{font-family:system-ui;max-width:560px;margin:72px auto;padding:0 20px;line-height:1.6;color:#202124}code{background:#f3f4f6;padding:2px 6px;border-radius:4px}</style>
+</head>
+<body>
+<h1>SSH MCP OAuth</h1>
+<p>${message}</p>
+<p>请通过 ChatGPT Connector 发起 OAuth 登录，不要直接在浏览器打开裸 <code>/authorize</code> 地址。</p>
+<p>Connector URL：<code>${baseUrl}/mcp</code></p>
+</body></html>`;
+}
+
 async function handleAuthorize(req: IncomingMessage, res: ServerResponse, config: RuntimeConfig): Promise<void> {
   if (!config.oauthLoginSecret) {
     sendText(res, 500, "OAuth is not configured");
@@ -860,7 +977,14 @@ async function handleAuthorize(req: IncomingMessage, res: ServerResponse, config
     const redirectUri = params.get("redirect_uri") ?? "";
     const codeChallenge = params.get("code_challenge") ?? "";
     if (!clientId || !redirectUri || !codeChallenge || !isRegisteredRedirectUri(clientId, redirectUri)) {
-      sendText(res, 400, "Invalid OAuth request");
+      sendHtml(
+        res,
+        200,
+        authorizeHelpHtml(
+          externalBaseUrl(req, config),
+          "缺少 OAuth 参数或 redirect_uri 未注册。这通常表示你尚未从 ChatGPT 发起授权。",
+        ),
+      );
       return;
     }
     sendHtml(res, 200, authorizeHtml(params));
@@ -1030,6 +1154,7 @@ async function main(): Promise<void> {
   if (process.env.NODE_ENV === "production" && !config.oauthBaseUrl && !config.httpToken) {
     throw new AppError(500, "Production deployments must set OAUTH_BASE_URL or SSH_MCP_HTTP_TOKEN", "CONFIG_INVALID");
   }
+  await bootstrapOAuthClients(config);
 
   const server = createServer((req, res) => {
     void route(req, res, config).catch((error) => {
