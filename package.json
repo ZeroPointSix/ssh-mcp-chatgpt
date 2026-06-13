@@ -1,8 +1,8 @@
 {
   "name": "ssh-mcp",
   "license": "MIT",
-  "version": "1.5.0",
-  "description": "MCP server exposing SSH control for Linux and Windows systems via Model Context Protocol.",
+  "version": "1.5.1",
+  "description": "SSH MCP server with stdio and ChatGPT-compatible remote HTTP/OAuth entrypoints.",
   "type": "module",
   "bin": {
     "ssh-mcp": "build/index.js"
@@ -10,6 +10,8 @@
   "scripts": {
     "prepare": "npm run build",
     "build": "tsc && shx chmod +x build/*.js",
+    "start:http": "cross-env SSH_MCP_DISABLE_MAIN=1 node build/chatgpt-http.js",
+    "dev:http": "cross-env SSH_MCP_DISABLE_MAIN=1 tsx src/chatgpt-http.ts",
     "inspect": "npx @modelcontextprotocol/inspector node build/index.js",
     "test": "cross-env SSH_MCP_DISABLE_MAIN=1 vitest --run",
     "test:watch": "cross-env SSH_MCP_DISABLE_MAIN=1 vitest",
@@ -34,19 +36,22 @@
     "typescript": "^5.9.2",
     "vitest": "^3.2.4"
   },
-  "homepage": "https://github.com/tufantunc/ssh-mcp#readme",
+  "homepage": "https://github.com/ZeroPointSix/ssh-mcp-chatgpt#readme",
   "repository": {
     "type": "git",
-    "url": "https://github.com/tufantunc/ssh-mcp.git"
+    "url": "https://github.com/ZeroPointSix/ssh-mcp-chatgpt.git"
   },
   "bugs": {
-    "url": "https://github.com/tufantunc/ssh-mcp/issues"
+    "url": "https://github.com/ZeroPointSix/ssh-mcp-chatgpt/issues"
   },
   "keywords": [
     "ssh",
     "mcp",
+    "chatgpt",
+    "apps-sdk",
     "model-context-protocol",
     "server",
+    "oauth",
     "windows",
     "linux",
     "automation",

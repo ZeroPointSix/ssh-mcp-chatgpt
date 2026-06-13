@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [ master ]
   pull_request:
-    branches: [ main ]
+    branches: [ master ]
 
 jobs:
   test:
@@ -30,6 +30,7 @@ jobs:
         with:
           node-version: 20
       - run: npm ci
+      - run: npm run build
       - name: Wait for sshd
         run: |
           for i in {1..60}; do
@@ -45,5 +46,3 @@ jobs:
           SSH_USER: test
           SSH_PASSWORD: secret
         run: npm test
-
-
