@@ -9,6 +9,9 @@ import { join } from 'path';
 
 const testServerPath = join(process.cwd(), 'build', 'index.js');
 const START_TIMEOUT = 10000;  // 10 seconds for server startup with su elevation
+const sshPort = Number(process.env.SSH_PORT || 2222);
+const sshUser = process.env.SSH_USER || 'test';
+const sshPassword = process.env.SSH_PASSWORD || 'secret';
 
 beforeAll(() => {
   process.env.SSH_MCP_TEST = '1';
@@ -18,9 +21,9 @@ function runMcpCommand(command: string, extraArgs: string[] = [], toolName = 'su
   const args = [
     testServerPath,
     '--host=127.0.0.1',
-    '--port=2222',
-    '--user=test',
-    '--password=secret',
+    `--port=${sshPort}`,
+    `--user=${sshUser}`,
+    `--password=${sshPassword}`,
     '--timeout=60000',
     ...extraArgs,
   ];
