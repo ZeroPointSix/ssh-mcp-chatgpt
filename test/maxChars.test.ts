@@ -5,8 +5,8 @@ import { join } from 'path';
 describe('maxChars CLI configuration', () => {
   const testServerPath = join(process.cwd(), 'build', 'index.js');
   
-  describe('default behavior (1000 chars)', () => {
-    it('should reject commands over 1000 characters by default', () => {
+  describe('default behavior (unlimited)', () => {
+    it('should not reject commands over 1000 characters by default', () => {
       const longCommand = 'echo ' + 'x'.repeat(1000);
       const args = [
         '--host=127.0.0.1',
@@ -41,7 +41,7 @@ describe('maxChars CLI configuration', () => {
       
       child.on('close', () => {
         const response = JSON.parse(output);
-        expect(response.error.message).toContain('Command is too long (max 1000 characters)');
+        expect(response.error?.message ?? '').not.toContain('Command is too long');
       });
       
       child.stdin.end();
@@ -178,7 +178,7 @@ describe('maxChars CLI configuration', () => {
   });
 
   describe('invalid maxChars values', () => {
-    it('should fall back to default for invalid string values', () => {
+    it('should fall back to the unlimited default for invalid string values', () => {
       const longCommand = 'echo ' + 'x'.repeat(1000);
       const args = [
         '--host=127.0.0.1',
@@ -213,7 +213,7 @@ describe('maxChars CLI configuration', () => {
       
       child.on('close', () => {
         const response = JSON.parse(output);
-        expect(response.error.message).toContain('Command is too long (max 1000 characters)');
+        expect(response.error?.message ?? '').not.toContain('Command is too long');
       });
       
       child.stdin.end();

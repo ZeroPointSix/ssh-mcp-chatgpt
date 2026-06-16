@@ -38,7 +38,7 @@ const DISABLE_SUDO = argvConfig.disableSudo !== undefined;
 const KEY = argvConfig.key;
 const DEFAULT_TIMEOUT = argvConfig.timeout ? parseInt(argvConfig.timeout) : 60000; // 60 seconds default timeout
 // Max characters configuration:
-// - Default: 1000 characters
+// - Default: unlimited
 // - When set via --maxChars:
 //   * a positive integer enforces that limit
 //   * 0 or a negative value disables the limit (no max)
@@ -49,11 +49,11 @@ const MAX_CHARS = (() => {
     const lowered = MAX_CHARS_RAW.toLowerCase();
     if (lowered === 'none') return Infinity;
     const parsed = parseInt(MAX_CHARS_RAW);
-    if (isNaN(parsed)) return 1000;
+    if (isNaN(parsed)) return Infinity;
     if (parsed <= 0) return Infinity;
     return parsed;
   }
-  return 1000;
+  return Infinity;
 })();
 
 function validateConfig(config: Record<string, string | null>) {

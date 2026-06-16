@@ -18,10 +18,14 @@ It keeps the existing stdio CLI for local MCP clients and adds a remote HTTP ent
 | Tool | Description |
 | ---- | ----------- |
 | `health` | Returns non-secret service status and deployment capabilities. |
-| `exec` | Executes a bounded shell command on the server-side configured SSH target. |
-| `sudo-exec` | Executes a bounded shell command through sudo when enabled server-side. |
+| `exec` | Executes a shell command on the server-side configured SSH target. Long commands return a `job_id` after `expire_time_ms` and keep running in the background. |
+| `sudo-exec` | Executes a shell command through sudo when enabled server-side, with the same background job behavior. |
+| `exec-status` | Polls stdout, stderr, exit status, and progress for a background `job_id`. |
+| `exec-cancel` | Cancels a running background `job_id`. |
 
 The SSH target is intentionally server-side configuration. ChatGPT should not choose arbitrary hosts or receive raw credentials from a user prompt.
+
+`exec` and `sudo-exec` return `status: "completed"` when the command finishes quickly. If the command is still running after `expire_time_ms`, they return `status: "running"` and a `job_id`; call `exec-status` with that ID until the job reaches `completed`, `failed`, `killed`, or `cancelled`. Stderr is returned as command output and does not by itself make the tool fail; the remote exit code and signal determine the command status.
 
 ## Quick Start: ChatGPT HTTP Mode
 
@@ -118,7 +122,7 @@ Example MCP client config:
         "--user=root",
         "--password=pass",
         "--timeout=30000",
-        "--maxChars=1000"
+        "--maxChars=none"
       ]
     }
   }
@@ -142,7 +146,9 @@ Example MCP client config:
 | `SSH_MCP_KEY` / `SSH_KEY` | Optional path to a mounted private key file. |
 | `SSH_MCP_DISABLE_SUDO` | Set `1` to hide `sudo-exec`. Recommended unless needed. |
 | `SSH_MCP_SUDO_PASSWORD` | Optional sudo password used only server-side. |
-| `SSH_MCP_MAX_CHARS` | Maximum command length. Use `none` or `0` to disable. |
+| `SSH_MCP_MAX_CHARS` | Maximum command length. Defaults to `none`; set a positive integer to enforce a deployment limit. |
+| `SSH_MCP_EXEC_EXPIRE_TIME_MS` | HTTP `exec` wait window before returning a background `job_id`, default `55000`. |
+| `SSH_MCP_EXEC_KILL_TIME_MS` | Optional hard deadline for killing background commands. Defaults to `none`; set a positive millisecond value to enforce. |
 | `SSH_MCP_DATA_DIR` | Data directory for redacted audit logs. |
 | `SSH_MCP_TOOL_CALL_LOG_ENABLED` | Set `0` to disable audit logging. |
 | `SSH_MCP_TOOL_CALL_NOTE_REQUIRED` | Set `1` to require `note` on tool calls. |
@@ -171,7 +177,7 @@ curl -sS \
 
 - Keep SSH credentials in server environment variables or mounted secret files.
 - Prefer a dedicated low-privilege SSH user and disable `sudo-exec` by default.
-- Keep `SSH_MCP_MAX_CHARS` bounded for ChatGPT-facing deployments.
+- Keep `SSH_MCP_MAX_CHARS` and `SSH_MCP_EXEC_KILL_TIME_MS` bounded for ChatGPT-facing deployments when your environment needs stricter guardrails.
 - Review redacted audit logs in `SSH_MCP_DATA_DIR/tool-calls/` when investigating tool use.
 - Use OAuth for ChatGPT connector setup. Static bearer tokens are best reserved for direct API clients and operations.
 

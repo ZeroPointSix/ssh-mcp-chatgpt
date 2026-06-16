@@ -143,6 +143,8 @@ curl -sS https://<your-domain>/mcp \
 - Do not ask users to paste SSH credentials into ChatGPT.
 - Prefer short, inspectable commands.
 - Use `exec` by default.
+- If `exec` returns `status: "running"`, keep the returned `job_id` and poll with `exec-status` until it reaches `completed`, `failed`, `killed`, or `cancelled`.
+- Use `exec-cancel` when a still-running background job should be stopped before its configured `kill_time_ms`.
 - Use `sudo-exec` only when the deployment has explicitly enabled it and the task requires privilege.
 - If a command might be destructive, ask the user for confirmation before running it.
 
@@ -154,6 +156,7 @@ curl -sS https://<your-domain>/mcp \
 | OAuth discovery fails | Confirm both `.well-known` endpoints return JSON and `OAUTH_BASE_URL` has no trailing slash. |
 | Tool calls return 401 | Reauthorize the connector or check `OAUTH_LOGIN_SECRET` and token exchange. |
 | Tool list works but calls fail | Check SSH target env vars and audit logs under `SSH_MCP_DATA_DIR/tool-calls/`. |
+| Long deployment still running | Use `exec-status` with the returned `job_id`; stderr is output, while exit code and signal determine failure. |
 | Sudo tool missing | `SSH_MCP_DISABLE_SUDO=1` hides `sudo-exec`; this is the recommended default. |
 | Accept header error | MCP POST requests must include `Accept: application/json, text/event-stream`. |
 

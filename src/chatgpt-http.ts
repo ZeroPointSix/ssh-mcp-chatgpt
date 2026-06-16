@@ -5,6 +5,7 @@ import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { createServer, type IncomingHttpHeaders, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { Client, type ClientChannel } from "ssh2";
 import type { SSHConfig } from "./index.js";
 
 type JsonRpcId = string | number | null;
@@ -16,12 +17,15 @@ const STREAMABLE_HTTP_ACCEPT = "application/json, text/event-stream";
 const MAX_BODY_BYTES = 1024 * 1024;
 const CODE_TTL_MS = 5 * 60 * 1000;
 const ACCESS_TOKEN_TTL_MS = 365 * 24 * 60 * 60 * 1000;
+const DEFAULT_EXEC_EXPIRE_TIME_MS = 55_000;
+const COMMAND_JOB_RETENTION_MS = 24 * 60 * 60 * 1000;
 
 const SERVER_INSTRUCTIONS = [
   "This connector executes shell commands on one server-side configured SSH target.",
   "Do not ask the user to paste SSH passwords, private keys, or host credentials into ChatGPT; credentials are configured on the server with environment variables.",
   "Use the optional note argument on tool calls to explain why a command is being run. It is written to a redacted audit log when logging is enabled.",
-  "Prefer precise, bounded commands. Avoid long-running interactive programs unless the deployment explicitly supports them.",
+  "Long-running commands return a job_id after expire_time_ms and continue in the background. Use exec-status to poll and exec-cancel to stop them.",
+  "Prefer precise, non-interactive commands. Ask for confirmation before destructive operations.",
 ].join("\n");
 
 class AppError extends Error {
@@ -47,6 +51,32 @@ interface RuntimeConfig {
   disableSudo: boolean;
   sudoPassword?: string;
   maxChars: number;
+  execExpireTimeMs: number;
+  execKillTimeMs?: number;
+}
+
+type CommandTool = "exec" | "sudo-exec";
+type CommandJobStatus = "running" | "completed" | "failed" | "killed" | "cancelled";
+
+interface CommandJob {
+  id: string;
+  tool: CommandTool;
+  commandLength: number;
+  status: CommandJobStatus;
+  createdAt: number;
+  startedAt?: number;
+  completedAt?: number;
+  expireTimeMs: number;
+  killTimeMs?: number;
+  stdout: string;
+  stderr: string;
+  exitCode?: number | null;
+  signal?: string | null;
+  error?: string;
+  conn?: Client;
+  stream?: ClientChannel;
+  killTimer?: NodeJS.Timeout;
+  waiters: Set<() => void>;
 }
 
 interface ClientRegistration {
@@ -71,6 +101,7 @@ const OAUTH_PREFIX_MARKER = "prefix:";
 const clientRegistrations = new Map<string, ClientRegistration>();
 const authCodes = new Map<string, PendingAuthCode>();
 const accessTokens = new Map<string, AccessTokenEntry>();
+const commandJobs = new Map<string, CommandJob>();
 
 function oauthPrefixEntry(prefix: string): string {
   return `${OAUTH_PREFIX_MARKER}${prefix}`;
@@ -152,8 +183,27 @@ const cleanupTimer = setInterval(() => {
   for (const [token, entry] of accessTokens) {
     if (entry.expiresAt < now) accessTokens.delete(token);
   }
+  cleanupCommandJobs(now);
 }, 60_000);
 cleanupTimer.unref?.();
+
+function isTerminalJobStatus(status: CommandJobStatus): boolean {
+  return status !== "running";
+}
+
+function notifyCommandJobWaiters(job: CommandJob): void {
+  const waiters = [...job.waiters];
+  job.waiters.clear();
+  for (const waiter of waiters) waiter();
+}
+
+function cleanupCommandJobs(now = Date.now()): void {
+  for (const [jobId, job] of commandJobs) {
+    if (isTerminalJobStatus(job.status) && (job.completedAt ?? job.createdAt) + COMMAND_JOB_RETENTION_MS < now) {
+      commandJobs.delete(jobId);
+    }
+  }
+}
 
 function getEnv(...names: string[]): string | undefined {
   for (const name of names) {
@@ -181,11 +231,34 @@ function parseInteger(value: string | undefined, fallback: number, name: string)
 }
 
 function parseMaxChars(value: string | undefined): number {
-  if (!value) return 1000;
+  if (!value) return Infinity;
   if (value.toLowerCase() === "none") return Infinity;
   const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed)) return 1000;
+  if (!Number.isFinite(parsed)) return Infinity;
   return parsed <= 0 ? Infinity : parsed;
+}
+
+function parseDurationMs(value: string | undefined, fallback: number | undefined, name: string): number | undefined {
+  if (!value) return fallback;
+  const normalized = value.toLowerCase();
+  if (normalized === "none" || normalized === "off" || normalized === "0") return undefined;
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new AppError(500, `${name} must be a positive integer number of milliseconds, or none`, "CONFIG_INVALID");
+  }
+  return parsed;
+}
+
+function parseDurationArg(value: unknown, fallback: number | undefined, name: string): number | undefined {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "none" || normalized === "off" || normalized === "0") return undefined;
+    const parsed = Number.parseInt(normalized, 10);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) return Math.floor(value);
+  throw new AppError(400, `${name} must be a positive integer number of milliseconds, or none`, "INVALID_PARAMS");
 }
 
 function parseCsv(value: string | undefined): string[] {
@@ -227,6 +300,16 @@ function loadRuntimeConfig(): RuntimeConfig {
     disableSudo: isEnabled(getEnv("SSH_MCP_DISABLE_SUDO"), false),
     sudoPassword: getRawEnv("SSH_MCP_SUDO_PASSWORD", "SUDO_PASSWORD"),
     maxChars: parseMaxChars(getEnv("SSH_MCP_MAX_CHARS", "MAX_CHARS")),
+    execExpireTimeMs: parseDurationMs(
+      getEnv("SSH_MCP_EXEC_EXPIRE_TIME_MS", "SSH_MCP_EXPIRE_TIME_MS", "EXEC_EXPIRE_TIME_MS"),
+      DEFAULT_EXEC_EXPIRE_TIME_MS,
+      "SSH_MCP_EXEC_EXPIRE_TIME_MS",
+    ) ?? DEFAULT_EXEC_EXPIRE_TIME_MS,
+    execKillTimeMs: parseDurationMs(
+      getEnv("SSH_MCP_EXEC_KILL_TIME_MS", "SSH_MCP_KILL_TIME_MS", "EXEC_KILL_TIME_MS"),
+      undefined,
+      "SSH_MCP_EXEC_KILL_TIME_MS",
+    ),
   };
 }
 
@@ -437,13 +520,147 @@ function shellSingleQuote(value: string): string {
   return value.replace(/'/g, "'\\''");
 }
 
-function textFromMcpResult(result: unknown): string {
-  const object = result as { content?: Array<{ type?: string; text?: string }> };
-  if (!Array.isArray(object.content)) return "";
-  return object.content
-    .filter((item) => item?.type === "text" && typeof item.text === "string")
-    .map((item) => item.text ?? "")
-    .join("");
+function formatSshExitStatus(code: number | null, signal: string | null): string {
+  if (signal) return code === null ? `signal ${signal}` : `code ${code}, signal ${signal}`;
+  return code === null ? "unknown exit status" : `code ${code}`;
+}
+
+function commandJobPayload(job: CommandJob): JsonObject {
+  const now = Date.now();
+  const completedAt = job.completedAt;
+  const payload: JsonObject = {
+    status: job.status,
+    tool: job.tool,
+    job_id: job.id,
+    stdout: job.stdout,
+    stderr: job.stderr,
+    command_length: job.commandLength,
+    elapsed_ms: (completedAt ?? now) - job.createdAt,
+    created_at: new Date(job.createdAt).toISOString(),
+    expire_time_ms: job.expireTimeMs,
+    kill_time_ms: job.killTimeMs ?? "none",
+  };
+  if (job.startedAt) payload.started_at = new Date(job.startedAt).toISOString();
+  if (completedAt) payload.completed_at = new Date(completedAt).toISOString();
+  if (job.exitCode !== undefined) payload.exit_code = job.exitCode;
+  if (job.signal !== undefined) payload.signal = job.signal;
+  if (job.error) payload.error = job.error;
+  if (job.status === "running") {
+    payload.next_action = `Command is still running. Call exec-status with job_id ${job.id} to fetch progress.`;
+  }
+  return payload;
+}
+
+function finishCommandJob(job: CommandJob, updates: Partial<CommandJob>): void {
+  if (isTerminalJobStatus(job.status)) return;
+  Object.assign(job, updates, { completedAt: Date.now() });
+  if (job.killTimer) clearTimeout(job.killTimer);
+  job.killTimer = undefined;
+  try { job.stream?.removeAllListeners(); } catch { /* ignore */ }
+  try { job.conn?.end(); } catch { /* ignore */ }
+  job.stream = undefined;
+  job.conn = undefined;
+  notifyCommandJobWaiters(job);
+}
+
+function failCommandJob(job: CommandJob, error: string): void {
+  finishCommandJob(job, { status: "failed", error });
+}
+
+function stopCommandJob(job: CommandJob, status: "killed" | "cancelled", error: string): boolean {
+  if (isTerminalJobStatus(job.status)) return false;
+  try { (job.stream as any)?.signal?.("KILL"); } catch { /* ignore */ }
+  try { job.stream?.close(); } catch { /* ignore */ }
+  finishCommandJob(job, { status, error });
+  return true;
+}
+
+function startSshCommandJob(
+  tool: CommandTool,
+  sshConfig: SSHConfig,
+  remoteCommand: string,
+  commandLength: number,
+  expireTimeMs: number,
+  killTimeMs?: number,
+): CommandJob {
+  const job: CommandJob = {
+    id: `job-${randomToken(12)}`,
+    tool,
+    commandLength,
+    status: "running",
+    createdAt: Date.now(),
+    expireTimeMs,
+    killTimeMs,
+    stdout: "",
+    stderr: "",
+    waiters: new Set(),
+  };
+  commandJobs.set(job.id, job);
+
+  const conn = new Client();
+  job.conn = conn;
+
+  if (killTimeMs) {
+    job.killTimer = setTimeout(() => {
+      stopCommandJob(job, "killed", `Command exceeded kill_time_ms (${killTimeMs}ms)`);
+    }, killTimeMs);
+    job.killTimer.unref?.();
+  }
+
+  conn.on("ready", () => {
+    job.startedAt = Date.now();
+    conn.exec(remoteCommand, (err: Error | undefined, stream: ClientChannel) => {
+      if (err) {
+        failCommandJob(job, `SSH exec error: ${err.message}`);
+        return;
+      }
+
+      job.stream = stream;
+      stream.on("data", (data: Buffer) => {
+        job.stdout += data.toString();
+      });
+      stream.stderr.on("data", (data: Buffer) => {
+        job.stderr += data.toString();
+      });
+      stream.on("close", (code: number | null, signal: string | null) => {
+        if (isTerminalJobStatus(job.status)) return;
+        job.exitCode = code;
+        job.signal = signal;
+        if (code === 0 && !signal) {
+          finishCommandJob(job, { status: "completed" });
+        } else {
+          failCommandJob(job, `Error (${formatSshExitStatus(code, signal)}):\n${job.stderr || job.stdout}`);
+        }
+      });
+    });
+  });
+
+  conn.on("error", (err: Error) => {
+    failCommandJob(job, `SSH connection error: ${err.message}`);
+  });
+  conn.on("close", () => {
+    if (job.status === "running" && !job.stream) {
+      failCommandJob(job, "SSH connection closed before the command started");
+    }
+  });
+  conn.connect(sshConfig);
+  return job;
+}
+
+function waitForCommandJob(job: CommandJob, expireTimeMs: number): Promise<CommandJob> {
+  if (isTerminalJobStatus(job.status)) return Promise.resolve(job);
+  return new Promise((resolve) => {
+    const onDone = () => {
+      clearTimeout(timeout);
+      resolve(job);
+    };
+    const timeout = setTimeout(() => {
+      job.waiters.delete(onDone);
+      resolve(job);
+    }, expireTimeMs);
+    timeout.unref?.();
+    job.waiters.add(onDone);
+  });
 }
 
 async function loadSshConfig(): Promise<SSHConfig> {
@@ -478,15 +695,12 @@ async function loadSshConfig(): Promise<SSHConfig> {
   return config;
 }
 
-async function loadSshModule(): Promise<typeof import("./index.js")> {
-  process.env.SSH_MCP_DISABLE_MAIN = "1";
-  return import("./index.js");
-}
-
 async function runSshTool(name: "exec" | "sudo-exec", args: JsonObject, config: RuntimeConfig): Promise<JsonObject> {
   const command = sanitizeCommand(requireString(args.command, "command"), config.maxChars);
   const description = optionalString(args.description);
   const commandWithDescription = appendDescription(command, description);
+  const expireTimeMs = parseDurationArg(args.expire_time_ms, config.execExpireTimeMs, "expire_time_ms") ?? config.execExpireTimeMs;
+  const killTimeMs = parseDurationArg(args.kill_time_ms, config.execKillTimeMs, "kill_time_ms");
 
   let remoteCommand = commandWithDescription;
   if (name === "sudo-exec") {
@@ -502,15 +716,27 @@ async function runSshTool(name: "exec" | "sudo-exec", args: JsonObject, config: 
   }
 
   const sshConfig = await loadSshConfig();
-  const { execSshCommand } = await loadSshModule();
-  const result = await execSshCommand(sshConfig, remoteCommand);
+  const job = startSshCommandJob(name, sshConfig, remoteCommand, command.length, expireTimeMs, killTimeMs);
+  await waitForCommandJob(job, expireTimeMs);
+  return commandJobPayload(job);
+}
 
-  return {
-    status: "completed",
-    tool: name,
-    stdout: textFromMcpResult(result),
-    command_length: command.length,
-  };
+function getCommandJob(args: JsonObject): CommandJob {
+  const jobId = requireString(args.job_id, "job_id");
+  const job = commandJobs.get(jobId);
+  if (!job) throw new AppError(404, `Unknown command job: ${jobId}`, "JOB_NOT_FOUND");
+  return job;
+}
+
+function runCommandStatusTool(args: JsonObject): JsonObject {
+  cleanupCommandJobs();
+  return commandJobPayload(getCommandJob(args));
+}
+
+function runCommandCancelTool(args: JsonObject): JsonObject {
+  const job = getCommandJob(args);
+  stopCommandJob(job, "cancelled", "Command cancelled by exec-cancel");
+  return commandJobPayload(job);
 }
 
 function redactArgs(args: JsonObject): JsonObject {
@@ -578,6 +804,9 @@ const HEALTH_OUTPUT_SCHEMA: JsonObject = {
     audit_log_enabled: { type: "boolean" },
     note_required: { type: "boolean" },
     max_command_chars: { anyOf: [{ type: "number" }, { type: "string", enum: ["none"] }] },
+    default_expire_time_ms: { type: "number" },
+    default_kill_time_ms: { anyOf: [{ type: "number" }, { type: "string", enum: ["none"] }] },
+    active_background_jobs: { type: "number" },
     ssh_target_configured: { type: "boolean" },
   },
   required: [
@@ -592,6 +821,9 @@ const HEALTH_OUTPUT_SCHEMA: JsonObject = {
     "audit_log_enabled",
     "note_required",
     "max_command_chars",
+    "default_expire_time_ms",
+    "default_kill_time_ms",
+    "active_background_jobs",
     "ssh_target_configured",
   ],
   additionalProperties: false,
@@ -600,12 +832,23 @@ const HEALTH_OUTPUT_SCHEMA: JsonObject = {
 const COMMAND_OUTPUT_SCHEMA: JsonObject = {
   type: "object",
   properties: {
-    status: { type: "string", enum: ["completed", "failed"] },
+    status: { type: "string", enum: ["running", "completed", "failed", "killed", "cancelled"] },
     tool: { type: "string", enum: ["exec", "sudo-exec"] },
+    job_id: { type: "string" },
     stdout: { type: "string" },
+    stderr: { type: "string" },
     command_length: { type: "number" },
+    elapsed_ms: { type: "number" },
+    created_at: { type: "string" },
+    started_at: { type: "string" },
+    completed_at: { type: "string" },
+    expire_time_ms: { type: "number" },
+    kill_time_ms: { anyOf: [{ type: "number" }, { type: "string", enum: ["none"] }] },
+    exit_code: { anyOf: [{ type: "number" }, { type: "null" }] },
+    signal: { anyOf: [{ type: "string" }, { type: "null" }] },
     error: { type: "string" },
     code: { type: "string" },
+    next_action: { type: "string" },
   },
   required: ["status"],
   additionalProperties: false,
@@ -642,11 +885,13 @@ function listTools(config: RuntimeConfig): JsonObject[] {
       {
         name: "exec",
         description:
-          "Execute a bounded shell command on the server-side configured SSH target. Credentials and target host are configured by the deployment, not by ChatGPT. Ask for confirmation before running destructive commands.",
+          "Execute a shell command on the server-side configured SSH target. If the command exceeds expire_time_ms, the tool returns a running job_id while the command continues in the background. Use exec-status to poll it. Credentials and target host are configured by the deployment, not by ChatGPT. Ask for confirmation before running destructive commands.",
         inputSchema: schema(
           {
             command: { type: "string", minLength: 1, description: "Shell command to execute on the configured SSH target." },
             description: { type: "string", description: "Optional legacy command comment appended on the remote shell." },
+            expire_time_ms: { type: "number", description: "Optional time to wait before returning a running job_id. Defaults to deployment configuration." },
+            kill_time_ms: { anyOf: [{ type: "number" }, { type: "string", enum: ["none"] }], description: "Optional hard deadline for killing the background command. Defaults to deployment configuration; none disables the hard deadline." },
           },
           ["command"],
         ),
@@ -655,6 +900,31 @@ function listTools(config: RuntimeConfig): JsonObject[] {
           "openai/toolInvocation/invoking": "Running SSH command",
           "openai/toolInvocation/invoked": "SSH command finished",
         },
+      },
+      protectedSchemes,
+    ),
+    withSecurity(
+      {
+        name: "exec-status",
+        description: "Fetch stdout, stderr, exit status, and progress for a background exec or sudo-exec job_id.",
+        inputSchema: schema(
+          { job_id: { type: "string", minLength: 1, description: "Background command job_id returned by exec or sudo-exec." } },
+          ["job_id"],
+        ),
+        outputSchema: COMMAND_OUTPUT_SCHEMA,
+        annotations: { readOnlyHint: true },
+      },
+      protectedSchemes,
+    ),
+    withSecurity(
+      {
+        name: "exec-cancel",
+        description: "Cancel a running background exec or sudo-exec job_id by sending a kill signal to the SSH channel.",
+        inputSchema: schema(
+          { job_id: { type: "string", minLength: 1, description: "Background command job_id returned by exec or sudo-exec." } },
+          ["job_id"],
+        ),
+        outputSchema: COMMAND_OUTPUT_SCHEMA,
       },
       protectedSchemes,
     ),
@@ -671,6 +941,8 @@ function listTools(config: RuntimeConfig): JsonObject[] {
             {
               command: { type: "string", minLength: 1, description: "Shell command to execute with sudo." },
               description: { type: "string", description: "Optional legacy command comment appended on the remote shell." },
+              expire_time_ms: { type: "number", description: "Optional time to wait before returning a running job_id. Defaults to deployment configuration." },
+              kill_time_ms: { anyOf: [{ type: "number" }, { type: "string", enum: ["none"] }], description: "Optional hard deadline for killing the background command. Defaults to deployment configuration; none disables the hard deadline." },
             },
             ["command"],
           ),
@@ -701,6 +973,9 @@ function healthPayload(config: RuntimeConfig): JsonObject {
     audit_log_enabled: config.toolCallLogEnabled,
     note_required: config.toolCallNoteRequired,
     max_command_chars: Number.isFinite(config.maxChars) ? config.maxChars : "none",
+    default_expire_time_ms: config.execExpireTimeMs,
+    default_kill_time_ms: config.execKillTimeMs ?? "none",
+    active_background_jobs: [...commandJobs.values()].filter((job) => job.status === "running").length,
     ssh_target_configured: Boolean(getEnv("SSH_MCP_HOST", "SSH_HOST") && getEnv("SSH_MCP_USER", "SSH_USER")),
   };
 }
@@ -709,6 +984,8 @@ async function invokeTool(name: string, args: JsonObject, sessionId: string, con
   await auditToolCall(name, args, sessionId, config);
   if (name === "health") return healthPayload(config);
   if (name === "exec" || name === "sudo-exec") return runSshTool(name, args, config);
+  if (name === "exec-status") return runCommandStatusTool(args);
+  if (name === "exec-cancel") return runCommandCancelTool(args);
   throw new AppError(404, `Unknown tool: ${name}`, "UNKNOWN_TOOL");
 }
 
@@ -1173,4 +1450,4 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   void main();
 }
 
-export { loadRuntimeConfig, listTools, healthPayload };
+export { loadRuntimeConfig, listTools, healthPayload, invokeTool };
