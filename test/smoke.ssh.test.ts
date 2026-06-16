@@ -26,6 +26,12 @@ describe('ssh smoke', () => {
       execSshCommand({ host, port, username, password }, 'sh -c "echo stderr-error >&2; exit 7"'),
     ).rejects.toThrow('Error (code 7):\nstderr-error');
   }, 20000);
+
+  it('rejects commands terminated by signal or missing exit status', async () => {
+    await expect(
+      execSshCommand({ host, port, username, password }, 'sh -c "kill -TERM $$"'),
+    ).rejects.toThrow(/Error \((code [1-9][0-9]*|signal [^)]+|unknown exit status)/);
+  }, 20000);
 });
 
 describe('maxChars configuration', () => {

@@ -244,7 +244,7 @@ describe('SSHConnectionManager', () => {
       // Generate large output (500 lines)
       const result = await execSshCommandWithConnection(
         manager, 
-        'for i in {1..500}; do echo "Line $i"; done'
+        'i=1; while [ "$i" -le 500 ]; do echo "Line $i"; i=$((i + 1)); done'
       );
       
       const output = (result.content[0] as any).text;
