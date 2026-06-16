@@ -11,6 +11,27 @@ describe('ssh smoke', () => {
     const result: any = await execSshCommand({ host, port, username, password }, 'echo ok');
     expect(result.content[0]).toEqual({ type: 'text', text: 'ok\n' });
   }, 20000);
+
+  it('treats stderr output as successful when the command exits zero', async () => {
+    const result: any = await execSshCommand(
+      { host, port, username, password },
+      'sh -c "echo stdout-ok; echo stderr-warning >&2; exit 0"',
+    );
+
+    expect(result.content[0]).toEqual({ type: 'text', text: 'stdout-ok\nstderr-warning\n' });
+  }, 20000);
+
+  it('still rejects stderr output when the command exits non-zero', async () => {
+    await expect(
+      execSshCommand({ host, port, username, password }, 'sh -c "echo stderr-error >&2; exit 7"'),
+    ).rejects.toThrow('Error (code 7):\nstderr-error');
+  }, 20000);
+
+  it('rejects commands terminated by signal or missing exit status', async () => {
+    await expect(
+      execSshCommand({ host, port, username, password }, 'sh -c "kill -TERM $$"'),
+    ).rejects.toThrow(/Error \((code [1-9][0-9]*|signal [^)]+|unknown exit status)/);
+  }, 20000);
 });
 
 describe('maxChars configuration', () => {

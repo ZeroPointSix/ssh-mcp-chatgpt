@@ -142,10 +142,18 @@ describe('SSHConnectionManager', () => {
 
     it('should handle command with stderr', async () => {
       await manager.connect();
+
+      const successful = await execSshCommandWithConnection(
+        manager,
+        'sh -c "echo stdout-ok; echo stderr-warning >&2; exit 0"'
+      );
+
+      expect((successful.content[0] as any).text).toContain('stdout-ok');
+      expect((successful.content[0] as any).text).toContain('stderr-warning');
       
-      // This command writes to stderr
+      // This command writes to stderr and fails.
       await expect(
-        execSshCommandWithConnection(manager, 'echo "error" >&2 && exit 1')
+        execSshCommandWithConnection(manager, 'sh -c "echo stderr-error >&2; exit 7"')
       ).rejects.toThrow();
     }, 30000);
 
@@ -236,7 +244,7 @@ describe('SSHConnectionManager', () => {
       // Generate large output (500 lines)
       const result = await execSshCommandWithConnection(
         manager, 
-        'for i in {1..500}; do echo "Line $i"; done'
+        'i=1; while [ "$i" -le 500 ]; do echo "Line $i"; i=$((i + 1)); done'
       );
       
       const output = (result.content[0] as any).text;

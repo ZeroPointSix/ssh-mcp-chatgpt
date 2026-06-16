@@ -582,24 +582,31 @@ export async function execSshCommandWithConnection(manager: SSHConnectionManager
         stderr += data.toString();
       });
 
-      stream.on('close', (code: number, signal: string) => {
+      stream.on('close', (code: number | null, signal: string | null) => {
         if (!isResolved) {
           isResolved = true;
           clearTimeout(timeoutId);
-          if (stderr) {
-            reject(new McpError(ErrorCode.InternalError, `Error (code ${code}):\n${stderr}`));
-          } else {
+          if (code === 0 && !signal) {
             resolve({
               content: [{
                 type: 'text',
-                text: stdout,
+                text: stdout + stderr,
               }],
             });
+          } else {
+            reject(new McpError(ErrorCode.InternalError, `Error (${formatSshExitStatus(code, signal)}):\n${stderr || stdout}`));
           }
         }
       });
     });
   });
+}
+
+function formatSshExitStatus(code: number | null, signal: string | null): string {
+  if (signal) {
+    return code === null ? `signal ${signal}` : `code ${code}, signal ${signal}`;
+  }
+  return code === null ? 'unknown exit status' : `code ${code}`;
 }
 
 // Keep the old function for backward compatibility (used in tests)
@@ -656,20 +663,20 @@ export async function execSshCommand(sshConfig: any, command: string, stdin?: st
         try { stream.end(); } catch (e) { /* ignore */ }
         let stdout = '';
         let stderr = '';
-        stream.on('close', (code: number, signal: string) => {
+        stream.on('close', (code: number | null, signal: string | null) => {
           if (!isResolved) {
             isResolved = true;
             clearTimeout(timeoutId);
             conn.end();
-            if (stderr) {
-              reject(new McpError(ErrorCode.InternalError, `Error (code ${code}):\n${stderr}`));
-            } else {
+            if (code === 0 && !signal) {
               resolve({
                 content: [{
                   type: 'text',
-                  text: stdout,
+                  text: stdout + stderr,
                 }],
               });
+            } else {
+              reject(new McpError(ErrorCode.InternalError, `Error (${formatSshExitStatus(code, signal)}):\n${stderr || stdout}`));
             }
           }
         });
