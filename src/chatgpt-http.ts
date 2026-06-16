@@ -390,18 +390,20 @@ function profilePort(raw: Record<string, unknown>, profileId: string): number {
 }
 
 function loadRawProfilesConfig(): unknown | undefined {
+  const filePath = getEnv("SSH_MCP_PROFILES_FILE");
+  if (filePath) {
+    try {
+      return parseProfilesJson(readFileSync(filePath, "utf8"), "SSH_MCP_PROFILES_FILE");
+    } catch (error) {
+      if (error instanceof AppError) throw error;
+      const message = error instanceof Error ? error.message : "read failed";
+      throw new AppError(500, `Failed to read SSH_MCP_PROFILES_FILE: ${message}`, "CONFIG_INVALID");
+    }
+  }
+
   const inlineJson = getRawEnv("SSH_MCP_PROFILES_JSON");
   if (inlineJson) return parseProfilesJson(inlineJson, "SSH_MCP_PROFILES_JSON");
-
-  const filePath = getEnv("SSH_MCP_PROFILES_FILE");
-  if (!filePath) return undefined;
-  try {
-    return parseProfilesJson(readFileSync(filePath, "utf8"), "SSH_MCP_PROFILES_FILE");
-  } catch (error) {
-    if (error instanceof AppError) throw error;
-    const message = error instanceof Error ? error.message : "read failed";
-    throw new AppError(500, `Failed to read SSH_MCP_PROFILES_FILE: ${message}`, "CONFIG_INVALID");
-  }
+  return undefined;
 }
 
 function rawProfileEntries(raw: unknown): { entries: Array<[string | undefined, Record<string, unknown>]>; defaultProfileId?: string } {
@@ -1355,7 +1357,7 @@ function listTools(config: RuntimeConfig): JsonObject[] {
         inputSchema: schema(
           {
             target_id: TARGET_ID_INPUT_SCHEMA,
-            command: { type: "string", minLength: 1, description: "Shell command to execute on the configured SSH target." },
+            command: { type: "string", minLength: 1, description: "Shell command to execute on the selected SSH profile." },
             description: { type: "string", description: "Optional legacy command comment appended on the remote shell." },
             expire_time_ms: { type: "number", description: "Optional time to wait before returning a running job_id. Defaults to deployment configuration." },
             kill_time_ms: { anyOf: [{ type: "number" }, { type: "string", enum: ["none"] }], description: "Optional hard deadline for killing the background command. Defaults to deployment configuration; none disables the hard deadline." },
@@ -1407,7 +1409,7 @@ function listTools(config: RuntimeConfig): JsonObject[] {
           inputSchema: schema(
             {
               target_id: TARGET_ID_INPUT_SCHEMA,
-              command: { type: "string", minLength: 1, description: "Shell command to execute with sudo." },
+              command: { type: "string", minLength: 1, description: "Shell command to execute with sudo on the selected SSH profile." },
               description: { type: "string", description: "Optional legacy command comment appended on the remote shell." },
               expire_time_ms: { type: "number", description: "Optional time to wait before returning a running job_id. Defaults to deployment configuration." },
               kill_time_ms: { anyOf: [{ type: "number" }, { type: "string", enum: ["none"] }], description: "Optional hard deadline for killing the background command. Defaults to deployment configuration; none disables the hard deadline." },

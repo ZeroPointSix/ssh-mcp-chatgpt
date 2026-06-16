@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -110,6 +110,53 @@ describe('ChatGPT HTTP SSH profiles', () => {
     expect(tools.map((tool: any) => tool.name)).toEqual(expect.arrayContaining(['list-profiles', 'exec', 'sudo-exec']));
     const execTool = tools.find((tool: any) => tool.name === 'exec') as any;
     expect(execTool.inputSchema.properties.target_id).toBeDefined();
+  });
+
+  it('prefers SSH_MCP_PROFILES_FILE over SSH_MCP_PROFILES_JSON when both are configured', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'ssh-mcp-profiles-file-'));
+    tempDirs.push(dir);
+    const profilesPath = join(dir, 'profiles.json');
+    await writeFile(
+      profilesPath,
+      JSON.stringify({
+        default: 'file',
+        profiles: [
+          {
+            id: 'file',
+            label: 'File VPS',
+            host: '10.0.0.9',
+            user: 'deploy',
+            password: 'file-secret',
+            sudo_enabled: true,
+          },
+        ],
+      }),
+      'utf8',
+    );
+
+    process.env.SSH_MCP_PROFILES_FILE = profilesPath;
+    process.env.SSH_MCP_PROFILES_JSON = JSON.stringify({
+      default: 'inline',
+      profiles: [
+        {
+          id: 'inline',
+          label: 'Inline VPS',
+          host: '10.0.0.8',
+          user: 'deploy',
+          password: 'inline-secret',
+          sudo_enabled: false,
+        },
+      ],
+    });
+    process.env.SSH_MCP_TOOL_CALL_LOG_ENABLED = '0';
+    process.env.SSH_MCP_DISABLE_SUDO = '0';
+
+    const config = loadRuntimeConfig();
+    const list = await invokeTool('list-profiles', { note: 'inspect file priority' }, 'session-1', config);
+
+    expect(list).toEqual({ profiles: [{ id: 'file', label: 'File VPS', sudo_enabled: true, default: true }] });
+    expect(JSON.stringify(list)).not.toContain('inline');
+    expect(healthPayload(config).default_ssh_profile_id).toBe('file');
   });
 
   it('routes exec to an explicit profile target_id', async () => {
