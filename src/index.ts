@@ -44,17 +44,18 @@ const DEFAULT_TIMEOUT = argvConfig.timeout ? parseInt(argvConfig.timeout) : 6000
 //   * 0 or a negative value disables the limit (no max)
 //   * the string "none" (case-insensitive) disables the limit (no max)
 const MAX_CHARS_RAW = argvConfig.maxChars;
-const MAX_CHARS = (() => {
-  if (typeof MAX_CHARS_RAW === 'string') {
-    const lowered = MAX_CHARS_RAW.toLowerCase();
+export function resolveMaxChars(value: string | null | undefined): number {
+  if (typeof value === 'string') {
+    const lowered = value.toLowerCase();
     if (lowered === 'none') return Infinity;
-    const parsed = parseInt(MAX_CHARS_RAW);
+    const parsed = parseInt(value);
     if (isNaN(parsed)) return Infinity;
     if (parsed <= 0) return Infinity;
     return parsed;
   }
   return Infinity;
-})();
+}
+const MAX_CHARS = resolveMaxChars(MAX_CHARS_RAW);
 
 function validateConfig(config: Record<string, string | null>) {
   const errors = [];
@@ -71,7 +72,7 @@ if (isCliEnabled) {
 }
 
 // Command sanitization and validation
-export function sanitizeCommand(command: string): string {
+export function sanitizeCommandWithMaxChars(command: string, maxChars: number): string {
   if (typeof command !== 'string') {
     throw new McpError(ErrorCode.InvalidParams, 'Command must be a string');
   }
@@ -82,14 +83,18 @@ export function sanitizeCommand(command: string): string {
   }
 
   // Length check
-  if (Number.isFinite(MAX_CHARS) && trimmedCommand.length > (MAX_CHARS as number)) {
+  if (Number.isFinite(maxChars) && trimmedCommand.length > maxChars) {
     throw new McpError(
       ErrorCode.InvalidParams,
-      `Command is too long (max ${MAX_CHARS} characters)`
+      `Command is too long (max ${maxChars} characters)`
     );
   }
 
   return trimmedCommand;
+}
+
+export function sanitizeCommand(command: string): string {
+  return sanitizeCommandWithMaxChars(command, MAX_CHARS);
 }
 
 function sanitizePassword(password: string | undefined): string | undefined {

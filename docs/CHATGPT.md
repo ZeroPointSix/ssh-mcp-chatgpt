@@ -143,8 +143,9 @@ curl -sS https://<your-domain>/mcp \
 - Do not ask users to paste SSH credentials into ChatGPT.
 - Prefer short, inspectable commands.
 - Use `exec` by default.
-- If `exec` returns `status: "running"`, keep the returned `job_id` and poll with `exec-status` until it reaches `completed`, `failed`, `killed`, or `cancelled`.
-- Use `exec-cancel` when a still-running background job should be stopped before its configured `kill_time_ms`.
+- If `exec` returns `status: "running"`, keep the returned `job_id` and poll with `exec-status` until it reaches `completed`, `failed`, `killed`, or `cancelled`. If the status is `cancelling` or `kill_requested`, the stop was requested but the SSH channel has not yet confirmed the final terminal status.
+- Use `exec-cancel` when a still-running background job should be stopped before its configured `kill_time_ms`, then keep polling with `exec-status`.
+- Large stdout/stderr are retained as a bounded tail controlled by `SSH_MCP_EXEC_OUTPUT_MAX_CHARS`; check `stdout_truncated` and `stderr_truncated` in tool output.
 - Use `sudo-exec` only when the deployment has explicitly enabled it and the task requires privilege.
 - If a command might be destructive, ask the user for confirmation before running it.
 

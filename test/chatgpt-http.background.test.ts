@@ -32,6 +32,7 @@ afterEach(() => {
 describe('ChatGPT HTTP background command tools', () => {
   it('advertises background polling controls and unlimited default command length', () => {
     delete process.env.SSH_MCP_MAX_CHARS;
+    delete process.env.SSH_MCP_EXEC_OUTPUT_MAX_CHARS;
     process.env.SSH_MCP_TOOL_CALL_LOG_ENABLED = '0';
 
     const config = loadRuntimeConfig();
@@ -39,6 +40,7 @@ describe('ChatGPT HTTP background command tools', () => {
     const toolNames = listTools(config).map((tool: any) => tool.name);
 
     expect(health.max_command_chars).toBe('none');
+    expect(health.default_output_max_chars).toBe(200000);
     expect(health.default_expire_time_ms).toBe(55000);
     expect(health.default_kill_time_ms).toBe('none');
     expect(toolNames).toEqual(expect.arrayContaining(['exec', 'exec-status', 'exec-cancel']));
@@ -69,5 +71,62 @@ describe('ChatGPT HTTP background command tools', () => {
     expect(current.stdout).toContain('background-done');
     expect(current.stderr).toBe('');
     expect(current.exit_code).toBe(0);
+  }, 10000);
+
+  it('retains only bounded output tails with truncation metadata', async () => {
+    configureSshTarget();
+    process.env.SSH_MCP_EXEC_OUTPUT_MAX_CHARS = '12';
+    const config = loadRuntimeConfig();
+
+    const result = await invokeTool(
+      'exec',
+      { command: 'printf abcdefghijklmnopqr', expire_time_ms: 5000, note: 'test output truncation' },
+      'test-session',
+      config,
+    );
+
+    expect(result.status).toBe('completed');
+    expect(result.stdout).toBe('ghijklmnopqr');
+    expect(result.stdout_truncated).toBe(true);
+    expect(result.stdout_total_chars).toBe(18);
+    expect(result.stderr_truncated).toBe(false);
+    expect(result.output_max_chars).toBe(12);
+  }, 10000);
+
+  it('reports cancellation as requested before the final terminal status is confirmed', async () => {
+    configureSshTarget();
+    const config = loadRuntimeConfig();
+
+    const started = await invokeTool(
+      'exec',
+      { command: 'sh -c "sleep 5; echo should-not-finish"', expire_time_ms: 50, kill_time_ms: 5000, note: 'test cancellation job' },
+      'test-session',
+      config,
+    );
+
+    expect(started.status).toBe('running');
+
+    const cancelled = await invokeTool(
+      'exec-cancel',
+      { job_id: started.job_id, note: 'cancel background job' },
+      'test-session',
+      config,
+    );
+
+    expect(['cancelling', 'cancelled']).toContain(cancelled.status);
+    expect(cancelled.stop_requested_status).toBe('cancelled');
+    if (cancelled.status === 'cancelling') {
+      expect(cancelled.completed_at).toBeUndefined();
+      expect(cancelled.next_action).toContain('exec-status');
+    }
+
+    let current = cancelled;
+    for (let attempt = 0; attempt < 20 && (current.status === 'running' || current.status === 'cancelling'); attempt += 1) {
+      await sleep(150);
+      current = await invokeTool('exec-status', { job_id: started.job_id, note: 'poll cancelled job' }, 'test-session', config);
+    }
+
+    expect(['cancelled', 'killed']).toContain(current.status);
+    expect(current.completed_at).toBeDefined();
   }, 10000);
 });

@@ -21,11 +21,11 @@ It keeps the existing stdio CLI for local MCP clients and adds a remote HTTP ent
 | `exec` | Executes a shell command on the server-side configured SSH target. Long commands return a `job_id` after `expire_time_ms` and keep running in the background. |
 | `sudo-exec` | Executes a shell command through sudo when enabled server-side, with the same background job behavior. |
 | `exec-status` | Polls stdout, stderr, exit status, and progress for a background `job_id`. |
-| `exec-cancel` | Cancels a running background `job_id`. |
+| `exec-cancel` | Requests cancellation for a running background `job_id`; poll `exec-status` until the final status is confirmed. |
 
 The SSH target is intentionally server-side configuration. ChatGPT should not choose arbitrary hosts or receive raw credentials from a user prompt.
 
-`exec` and `sudo-exec` return `status: "completed"` when the command finishes quickly. If the command is still running after `expire_time_ms`, they return `status: "running"` and a `job_id`; call `exec-status` with that ID until the job reaches `completed`, `failed`, `killed`, or `cancelled`. Stderr is returned as command output and does not by itself make the tool fail; the remote exit code and signal determine the command status.
+`exec` and `sudo-exec` return `status: "completed"` when the command finishes quickly. If the command is still running after `expire_time_ms`, they return `status: "running"` and a `job_id`; call `exec-status` with that ID until the job reaches `completed`, `failed`, `killed`, or `cancelled`. `exec-cancel` and `kill_time_ms` first move a job to `cancelling` or `kill_requested`; keep polling until the SSH channel confirms the final terminal status. Stderr is returned as command output and does not by itself make the tool fail; the remote exit code and signal determine the command status. Long-running stdout/stderr are retained as a bounded tail and report truncation metadata.
 
 ## Quick Start: ChatGPT HTTP Mode
 
@@ -149,6 +149,7 @@ Example MCP client config:
 | `SSH_MCP_MAX_CHARS` | Maximum command length. Defaults to `none`; set a positive integer to enforce a deployment limit. |
 | `SSH_MCP_EXEC_EXPIRE_TIME_MS` | HTTP `exec` wait window before returning a background `job_id`, default `55000`. |
 | `SSH_MCP_EXEC_KILL_TIME_MS` | Optional hard deadline for killing background commands. Defaults to `none`; set a positive millisecond value to enforce. |
+| `SSH_MCP_EXEC_OUTPUT_MAX_CHARS` | Maximum retained stdout and stderr tail per background job, default `200000`. Set `none` to disable truncation. |
 | `SSH_MCP_DATA_DIR` | Data directory for redacted audit logs. |
 | `SSH_MCP_TOOL_CALL_LOG_ENABLED` | Set `0` to disable audit logging. |
 | `SSH_MCP_TOOL_CALL_NOTE_REQUIRED` | Set `1` to require `note` on tool calls. |
@@ -177,7 +178,7 @@ curl -sS \
 
 - Keep SSH credentials in server environment variables or mounted secret files.
 - Prefer a dedicated low-privilege SSH user and disable `sudo-exec` by default.
-- Keep `SSH_MCP_MAX_CHARS` and `SSH_MCP_EXEC_KILL_TIME_MS` bounded for ChatGPT-facing deployments when your environment needs stricter guardrails.
+- Keep `SSH_MCP_MAX_CHARS`, `SSH_MCP_EXEC_KILL_TIME_MS`, and `SSH_MCP_EXEC_OUTPUT_MAX_CHARS` bounded for ChatGPT-facing deployments when your environment needs stricter guardrails.
 - Review redacted audit logs in `SSH_MCP_DATA_DIR/tool-calls/` when investigating tool use.
 - Use OAuth for ChatGPT connector setup. Static bearer tokens are best reserved for direct API clients and operations.
 

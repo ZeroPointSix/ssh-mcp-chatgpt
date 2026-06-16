@@ -18,13 +18,14 @@ const MAX_BODY_BYTES = 1024 * 1024;
 const CODE_TTL_MS = 5 * 60 * 1000;
 const ACCESS_TOKEN_TTL_MS = 365 * 24 * 60 * 60 * 1000;
 const DEFAULT_EXEC_EXPIRE_TIME_MS = 55_000;
+const DEFAULT_EXEC_OUTPUT_MAX_CHARS = 200_000;
 const COMMAND_JOB_RETENTION_MS = 24 * 60 * 60 * 1000;
 
 const SERVER_INSTRUCTIONS = [
   "This connector executes shell commands on one server-side configured SSH target.",
   "Do not ask the user to paste SSH passwords, private keys, or host credentials into ChatGPT; credentials are configured on the server with environment variables.",
   "Use the optional note argument on tool calls to explain why a command is being run. It is written to a redacted audit log when logging is enabled.",
-  "Long-running commands return a job_id after expire_time_ms and continue in the background. Use exec-status to poll and exec-cancel to stop them.",
+  "Long-running commands return a job_id after expire_time_ms and continue in the background. Use exec-status to poll and exec-cancel to request stopping, then poll until a final status is confirmed.",
   "Prefer precise, non-interactive commands. Ask for confirmation before destructive operations.",
 ].join("\n");
 
@@ -53,10 +54,13 @@ interface RuntimeConfig {
   maxChars: number;
   execExpireTimeMs: number;
   execKillTimeMs?: number;
+  execOutputMaxChars: number;
 }
 
 type CommandTool = "exec" | "sudo-exec";
-type CommandJobStatus = "running" | "completed" | "failed" | "killed" | "cancelled";
+type CommandJobTerminalStatus = "completed" | "failed" | "killed" | "cancelled";
+type CommandJobStopStatus = "killed" | "cancelled";
+type CommandJobStatus = "running" | "cancelling" | "kill_requested" | CommandJobTerminalStatus;
 
 interface CommandJob {
   id: string;
@@ -68,11 +72,21 @@ interface CommandJob {
   completedAt?: number;
   expireTimeMs: number;
   killTimeMs?: number;
+  outputMaxChars: number;
   stdout: string;
   stderr: string;
+  stdoutChars: number;
+  stderrChars: number;
+  stdoutTruncated: boolean;
+  stderrTruncated: boolean;
   exitCode?: number | null;
   signal?: string | null;
   error?: string;
+  stopRequestedStatus?: CommandJobStopStatus;
+  stopRequestedAt?: number;
+  stopReason?: string;
+  stopSignalSent?: boolean;
+  stopError?: string;
   conn?: Client;
   stream?: ClientChannel;
   killTimer?: NodeJS.Timeout;
@@ -188,7 +202,11 @@ const cleanupTimer = setInterval(() => {
 cleanupTimer.unref?.();
 
 function isTerminalJobStatus(status: CommandJobStatus): boolean {
-  return status !== "running";
+  return status === "completed" || status === "failed" || status === "killed" || status === "cancelled";
+}
+
+function isActiveJobStatus(status: CommandJobStatus): boolean {
+  return !isTerminalJobStatus(status);
 }
 
 function notifyCommandJobWaiters(job: CommandJob): void {
@@ -236,6 +254,17 @@ function parseMaxChars(value: string | undefined): number {
   const parsed = Number.parseInt(value, 10);
   if (!Number.isFinite(parsed)) return Infinity;
   return parsed <= 0 ? Infinity : parsed;
+}
+
+function parseOutputMaxChars(value: string | undefined): number {
+  if (!value) return DEFAULT_EXEC_OUTPUT_MAX_CHARS;
+  const normalized = value.toLowerCase();
+  if (normalized === "none" || normalized === "off" || normalized === "0") return Infinity;
+  const parsed = Number.parseInt(normalized, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new AppError(500, "SSH_MCP_EXEC_OUTPUT_MAX_CHARS must be a positive integer, or none", "CONFIG_INVALID");
+  }
+  return parsed;
 }
 
 function parseDurationMs(value: string | undefined, fallback: number | undefined, name: string): number | undefined {
@@ -309,6 +338,9 @@ function loadRuntimeConfig(): RuntimeConfig {
       getEnv("SSH_MCP_EXEC_KILL_TIME_MS", "SSH_MCP_KILL_TIME_MS", "EXEC_KILL_TIME_MS"),
       undefined,
       "SSH_MCP_EXEC_KILL_TIME_MS",
+    ),
+    execOutputMaxChars: parseOutputMaxChars(
+      getEnv("SSH_MCP_EXEC_OUTPUT_MAX_CHARS", "SSH_MCP_OUTPUT_MAX_CHARS", "EXEC_OUTPUT_MAX_CHARS"),
     ),
   };
 }
@@ -525,6 +557,44 @@ function formatSshExitStatus(code: number | null, signal: string | null): string
   return code === null ? "unknown exit status" : `code ${code}`;
 }
 
+function outputLimitPayload(maxChars: number): number | "none" {
+  return Number.isFinite(maxChars) ? maxChars : "none";
+}
+
+function appendCommandJobOutput(job: CommandJob, streamName: "stdout" | "stderr", data: Buffer): void {
+  const chunk = data.toString();
+  const maxChars = job.outputMaxChars;
+
+  if (streamName === "stdout") {
+    job.stdoutChars += chunk.length;
+    if (Number.isFinite(maxChars)) {
+      const combined = job.stdout + chunk;
+      if (combined.length > maxChars) {
+        job.stdout = combined.slice(combined.length - maxChars);
+        job.stdoutTruncated = true;
+      } else {
+        job.stdout = combined;
+      }
+      return;
+    }
+    job.stdout += chunk;
+    return;
+  }
+
+  job.stderrChars += chunk.length;
+  if (Number.isFinite(maxChars)) {
+    const combined = job.stderr + chunk;
+    if (combined.length > maxChars) {
+      job.stderr = combined.slice(combined.length - maxChars);
+      job.stderrTruncated = true;
+    } else {
+      job.stderr = combined;
+    }
+    return;
+  }
+  job.stderr += chunk;
+}
+
 function commandJobPayload(job: CommandJob): JsonObject {
   const now = Date.now();
   const completedAt = job.completedAt;
@@ -534,6 +604,11 @@ function commandJobPayload(job: CommandJob): JsonObject {
     job_id: job.id,
     stdout: job.stdout,
     stderr: job.stderr,
+    stdout_truncated: job.stdoutTruncated,
+    stderr_truncated: job.stderrTruncated,
+    stdout_total_chars: job.stdoutChars,
+    stderr_total_chars: job.stderrChars,
+    output_max_chars: outputLimitPayload(job.outputMaxChars),
     command_length: job.commandLength,
     elapsed_ms: (completedAt ?? now) - job.createdAt,
     created_at: new Date(job.createdAt).toISOString(),
@@ -541,12 +616,19 @@ function commandJobPayload(job: CommandJob): JsonObject {
     kill_time_ms: job.killTimeMs ?? "none",
   };
   if (job.startedAt) payload.started_at = new Date(job.startedAt).toISOString();
+  if (job.stopRequestedAt) payload.stop_requested_at = new Date(job.stopRequestedAt).toISOString();
+  if (job.stopRequestedStatus) payload.stop_requested_status = job.stopRequestedStatus;
+  if (job.stopSignalSent !== undefined) payload.stop_signal_sent = job.stopSignalSent;
+  if (job.stopError) payload.stop_error = job.stopError;
   if (completedAt) payload.completed_at = new Date(completedAt).toISOString();
   if (job.exitCode !== undefined) payload.exit_code = job.exitCode;
   if (job.signal !== undefined) payload.signal = job.signal;
   if (job.error) payload.error = job.error;
-  if (job.status === "running") {
+  if (isActiveJobStatus(job.status)) {
     payload.next_action = `Command is still running. Call exec-status with job_id ${job.id} to fetch progress.`;
+    if (job.status === "cancelling" || job.status === "kill_requested") {
+      payload.next_action = `Stop requested but not confirmed yet. Call exec-status with job_id ${job.id} to confirm the final state.`;
+    }
   }
   return payload;
 }
@@ -564,14 +646,49 @@ function finishCommandJob(job: CommandJob, updates: Partial<CommandJob>): void {
 }
 
 function failCommandJob(job: CommandJob, error: string): void {
+  if (job.stopRequestedStatus) {
+    finishCommandJob(job, { status: job.stopRequestedStatus, error: job.stopReason ?? error });
+    return;
+  }
   finishCommandJob(job, { status: "failed", error });
 }
 
-function stopCommandJob(job: CommandJob, status: "killed" | "cancelled", error: string): boolean {
+function finalizeStoppedCommandJob(job: CommandJob): void {
+  if (!job.stopRequestedStatus) return;
+  finishCommandJob(job, { status: job.stopRequestedStatus, error: job.stopReason });
+}
+
+function stopRequestedRuntimeStatus(status: CommandJobStopStatus): CommandJobStatus {
+  return status === "killed" ? "kill_requested" : "cancelling";
+}
+
+function requestStopCommandJob(job: CommandJob, status: CommandJobStopStatus, error: string): boolean {
   if (isTerminalJobStatus(job.status)) return false;
-  try { (job.stream as any)?.signal?.("KILL"); } catch { /* ignore */ }
-  try { job.stream?.close(); } catch { /* ignore */ }
-  finishCommandJob(job, { status, error });
+  job.status = stopRequestedRuntimeStatus(status);
+  job.stopRequestedStatus = status;
+  job.stopRequestedAt ??= Date.now();
+  job.stopReason = error;
+
+  let signalSent = false;
+  let stopError: string | undefined;
+  try {
+    (job.stream as (ClientChannel & { signal?: (signalName: string) => void }) | undefined)?.signal?.("KILL");
+    signalSent = Boolean(job.stream);
+  } catch (err) {
+    stopError = err instanceof Error ? err.message : "Failed to send SSH kill signal";
+  }
+  try { job.stream?.close(); } catch (err) {
+    stopError = err instanceof Error ? err.message : "Failed to close SSH channel";
+  }
+  if (!job.stream) {
+    try { job.conn?.end(); } catch (err) {
+      stopError = err instanceof Error ? err.message : "Failed to close SSH connection";
+    }
+  }
+
+  job.stopSignalSent = signalSent;
+  if (stopError) job.stopError = stopError;
+  notifyCommandJobWaiters(job);
   return true;
 }
 
@@ -581,6 +698,7 @@ function startSshCommandJob(
   remoteCommand: string,
   commandLength: number,
   expireTimeMs: number,
+  outputMaxChars: number,
   killTimeMs?: number,
 ): CommandJob {
   const job: CommandJob = {
@@ -591,8 +709,13 @@ function startSshCommandJob(
     createdAt: Date.now(),
     expireTimeMs,
     killTimeMs,
+    outputMaxChars,
     stdout: "",
     stderr: "",
+    stdoutChars: 0,
+    stderrChars: 0,
+    stdoutTruncated: false,
+    stderrTruncated: false,
     waiters: new Set(),
   };
   commandJobs.set(job.id, job);
@@ -602,7 +725,7 @@ function startSshCommandJob(
 
   if (killTimeMs) {
     job.killTimer = setTimeout(() => {
-      stopCommandJob(job, "killed", `Command exceeded kill_time_ms (${killTimeMs}ms)`);
+      requestStopCommandJob(job, "killed", `Command exceeded kill_time_ms (${killTimeMs}ms)`);
     }, killTimeMs);
     job.killTimer.unref?.();
   }
@@ -617,15 +740,19 @@ function startSshCommandJob(
 
       job.stream = stream;
       stream.on("data", (data: Buffer) => {
-        job.stdout += data.toString();
+        appendCommandJobOutput(job, "stdout", data);
       });
       stream.stderr.on("data", (data: Buffer) => {
-        job.stderr += data.toString();
+        appendCommandJobOutput(job, "stderr", data);
       });
       stream.on("close", (code: number | null, signal: string | null) => {
         if (isTerminalJobStatus(job.status)) return;
         job.exitCode = code;
         job.signal = signal;
+        if (job.stopRequestedStatus) {
+          finalizeStoppedCommandJob(job);
+          return;
+        }
         if (code === 0 && !signal) {
           finishCommandJob(job, { status: "completed" });
         } else {
@@ -639,6 +766,11 @@ function startSshCommandJob(
     failCommandJob(job, `SSH connection error: ${err.message}`);
   });
   conn.on("close", () => {
+    if (isTerminalJobStatus(job.status)) return;
+    if (job.stopRequestedStatus) {
+      finalizeStoppedCommandJob(job);
+      return;
+    }
     if (job.status === "running" && !job.stream) {
       failCommandJob(job, "SSH connection closed before the command started");
     }
@@ -716,7 +848,15 @@ async function runSshTool(name: "exec" | "sudo-exec", args: JsonObject, config: 
   }
 
   const sshConfig = await loadSshConfig();
-  const job = startSshCommandJob(name, sshConfig, remoteCommand, command.length, expireTimeMs, killTimeMs);
+  const job = startSshCommandJob(
+    name,
+    sshConfig,
+    remoteCommand,
+    command.length,
+    expireTimeMs,
+    config.execOutputMaxChars,
+    killTimeMs,
+  );
   await waitForCommandJob(job, expireTimeMs);
   return commandJobPayload(job);
 }
@@ -735,7 +875,7 @@ function runCommandStatusTool(args: JsonObject): JsonObject {
 
 function runCommandCancelTool(args: JsonObject): JsonObject {
   const job = getCommandJob(args);
-  stopCommandJob(job, "cancelled", "Command cancelled by exec-cancel");
+  requestStopCommandJob(job, "cancelled", "Command cancellation requested by exec-cancel");
   return commandJobPayload(job);
 }
 
@@ -804,6 +944,7 @@ const HEALTH_OUTPUT_SCHEMA: JsonObject = {
     audit_log_enabled: { type: "boolean" },
     note_required: { type: "boolean" },
     max_command_chars: { anyOf: [{ type: "number" }, { type: "string", enum: ["none"] }] },
+    default_output_max_chars: { anyOf: [{ type: "number" }, { type: "string", enum: ["none"] }] },
     default_expire_time_ms: { type: "number" },
     default_kill_time_ms: { anyOf: [{ type: "number" }, { type: "string", enum: ["none"] }] },
     active_background_jobs: { type: "number" },
@@ -821,6 +962,7 @@ const HEALTH_OUTPUT_SCHEMA: JsonObject = {
     "audit_log_enabled",
     "note_required",
     "max_command_chars",
+    "default_output_max_chars",
     "default_expire_time_ms",
     "default_kill_time_ms",
     "active_background_jobs",
@@ -832,15 +974,24 @@ const HEALTH_OUTPUT_SCHEMA: JsonObject = {
 const COMMAND_OUTPUT_SCHEMA: JsonObject = {
   type: "object",
   properties: {
-    status: { type: "string", enum: ["running", "completed", "failed", "killed", "cancelled"] },
+    status: { type: "string", enum: ["running", "cancelling", "kill_requested", "completed", "failed", "killed", "cancelled"] },
     tool: { type: "string", enum: ["exec", "sudo-exec"] },
     job_id: { type: "string" },
     stdout: { type: "string" },
     stderr: { type: "string" },
+    stdout_truncated: { type: "boolean" },
+    stderr_truncated: { type: "boolean" },
+    stdout_total_chars: { type: "number" },
+    stderr_total_chars: { type: "number" },
+    output_max_chars: { anyOf: [{ type: "number" }, { type: "string", enum: ["none"] }] },
     command_length: { type: "number" },
     elapsed_ms: { type: "number" },
     created_at: { type: "string" },
     started_at: { type: "string" },
+    stop_requested_at: { type: "string" },
+    stop_requested_status: { type: "string", enum: ["killed", "cancelled"] },
+    stop_signal_sent: { type: "boolean" },
+    stop_error: { type: "string" },
     completed_at: { type: "string" },
     expire_time_ms: { type: "number" },
     kill_time_ms: { anyOf: [{ type: "number" }, { type: "string", enum: ["none"] }] },
@@ -885,7 +1036,7 @@ function listTools(config: RuntimeConfig): JsonObject[] {
       {
         name: "exec",
         description:
-          "Execute a shell command on the server-side configured SSH target. If the command exceeds expire_time_ms, the tool returns a running job_id while the command continues in the background. Use exec-status to poll it. Credentials and target host are configured by the deployment, not by ChatGPT. Ask for confirmation before running destructive commands.",
+          "Execute a shell command on the server-side configured SSH target. If the command exceeds expire_time_ms, the tool returns a running job_id while the command continues in the background. Use exec-status to poll it. Output is retained as a bounded tail by deployment configuration. Credentials and target host are configured by the deployment, not by ChatGPT. Ask for confirmation before running destructive commands.",
         inputSchema: schema(
           {
             command: { type: "string", minLength: 1, description: "Shell command to execute on the configured SSH target." },
@@ -919,7 +1070,7 @@ function listTools(config: RuntimeConfig): JsonObject[] {
     withSecurity(
       {
         name: "exec-cancel",
-        description: "Cancel a running background exec or sudo-exec job_id by sending a kill signal to the SSH channel.",
+        description: "Request cancellation for a running background exec or sudo-exec job_id by sending a kill signal to the SSH channel; poll exec-status until the final cancelled/killed status is confirmed.",
         inputSchema: schema(
           { job_id: { type: "string", minLength: 1, description: "Background command job_id returned by exec or sudo-exec." } },
           ["job_id"],
@@ -973,9 +1124,10 @@ function healthPayload(config: RuntimeConfig): JsonObject {
     audit_log_enabled: config.toolCallLogEnabled,
     note_required: config.toolCallNoteRequired,
     max_command_chars: Number.isFinite(config.maxChars) ? config.maxChars : "none",
+    default_output_max_chars: outputLimitPayload(config.execOutputMaxChars),
     default_expire_time_ms: config.execExpireTimeMs,
     default_kill_time_ms: config.execKillTimeMs ?? "none",
-    active_background_jobs: [...commandJobs.values()].filter((job) => job.status === "running").length,
+    active_background_jobs: [...commandJobs.values()].filter((job) => isActiveJobStatus(job.status)).length,
     ssh_target_configured: Boolean(getEnv("SSH_MCP_HOST", "SSH_HOST") && getEnv("SSH_MCP_USER", "SSH_USER")),
   };
 }
