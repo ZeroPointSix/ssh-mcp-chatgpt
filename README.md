@@ -164,6 +164,8 @@ Example MCP client config:
 
 Profile JSON may be an object with `profiles` and an optional `default`, or an array of profiles. Object maps are also accepted. Each profile supports `id`, `label` or `name`, `host`, `port`, `user` or `username`, `password`, `private_key`, `private_key_path`, `sudo_enabled`, and `default`. Hostnames and credentials never appear in `list-profiles`, `health`, tool descriptions, or audit arguments.
 
+If `SSH_MCP_PROFILES_FILE` or `SSH_MCP_PROFILES_JSON` is set, the profile config must contain at least one profile. Empty profile configs such as `[]`, `{ "profiles": [] }`, or `{ "profiles": {} }` fail startup instead of silently falling back to the legacy single-target env.
+
 Example `profiles.json`:
 
 ```json

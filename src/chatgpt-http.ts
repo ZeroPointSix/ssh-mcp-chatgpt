@@ -432,6 +432,10 @@ function parseSshProfiles(): { profiles: SshProfileConfig[]; defaultSshProfileId
   if (raw === undefined) return { profiles: [] };
 
   const { entries, defaultProfileId: configuredDefault } = rawProfileEntries(raw);
+  if (entries.length === 0) {
+    throw new AppError(500, "SSH profile config must include at least one profile", "CONFIG_INVALID");
+  }
+
   const profiles: SshProfileConfig[] = [];
   const seen = new Set<string>();
   const markedDefaults: string[] = [];

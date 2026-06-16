@@ -49,3 +49,18 @@ Sandbox workspace: ws-8714f40b-4632-4b5b-85e3-bca70770b77d
 - `npm run build`: passed.
 - `npm test`: passed, 8 test files and 66 tests.
 - Remaining risk: PR #8 is still draft/open and CI visibility remains absent; no automatic merge was performed.
+
+## Scheduled Patrol - 2026-06-17 06:10 JST
+
+- Re-read Issue #7, all issue comments, PR #8 metadata, PR conversation comments, review submissions, review thread state, changed files, patch, commit status state, and workflow run state.
+- Found a new actionable PR review comment at 2026-06-16 21:08 UTC: empty profile configs such as `[]`, `{ "profiles": [] }`, or `{ "profiles": {} }` could be treated as no configured profiles and silently fall back to legacy single-target SSH env.
+- Fixed the boundary by making provided-but-empty profile config fail with `CONFIG_INVALID` (`SSH profile config must include at least one profile`) instead of allowing legacy fallback.
+- Added a regression test that sets legacy SSH env alongside each empty profile config shape and expects startup config loading to fail.
+- Updated README, `docs/CHATGPT.md`, and `deploy/.env.example` to document that empty profile configs fail startup.
+- Remote sandbox validation in `ws-3c551742-02b7-42ba-9310-eeb8a2453595`:
+  - Initial targeted test before dependency install failed with `cross-env: not found`; this was an environment dependency state, not a code failure.
+  - `npm ci --ignore-scripts --foreground-scripts`: passed; npm audit reported 26 existing dependency vulnerabilities.
+  - `npm test -- test/chatgpt-http.profiles.test.ts`: passed, 1 file and 9 tests.
+  - `npm run build`: passed.
+  - `npm test`: passed, 8 files and 67 tests, with a temporary live SSH test container that was removed afterward.
+- Remote sandbox note: direct patching of `deploy/.env.example` was blocked as a sensitive path, so the final comment-only update to that example file used a scoped Node text replacement after reading the real file context.

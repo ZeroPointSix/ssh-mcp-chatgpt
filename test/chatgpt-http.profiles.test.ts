@@ -159,6 +159,17 @@ describe('ChatGPT HTTP SSH profiles', () => {
     expect(healthPayload(config).default_ssh_profile_id).toBe('file');
   });
 
+  it('rejects empty profile config instead of falling back to legacy SSH env', () => {
+    process.env.SSH_MCP_HOST = '127.0.0.1';
+    process.env.SSH_MCP_USER = 'test';
+    process.env.SSH_MCP_PASSWORD = 'legacy-secret';
+
+    for (const profileConfig of [[], { profiles: [] }, { profiles: {} }]) {
+      process.env.SSH_MCP_PROFILES_JSON = JSON.stringify(profileConfig);
+      expect(() => loadRuntimeConfig()).toThrow('SSH profile config must include at least one profile');
+    }
+  });
+
   it('routes exec to an explicit profile target_id', async () => {
     configureProfiles();
     const config = loadRuntimeConfig();

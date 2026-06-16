@@ -55,6 +55,8 @@ SSH_MCP_PROFILES_FILE=/run/secrets/ssh-mcp-profiles.json
 SSH_MCP_DEFAULT_PROFILE=dev
 ```
 
+Profile config must contain at least one profile. Empty profile files or inline JSON fail startup instead of falling back to any legacy single-target SSH environment variables that may still be present.
+
 Use a dedicated, low-privilege SSH user for each profile. Enable `sudo-exec` only for deployments and profiles that truly need it. `SSH_MCP_DISABLE_SUDO=1` remains a global kill switch even when a profile has `sudo_enabled: true`.
 
 ## Deploy
