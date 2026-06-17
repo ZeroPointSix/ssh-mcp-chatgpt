@@ -1,6 +1,6 @@
 # ChatGPT Apps / Connectors Guide
 
-This project exposes a ChatGPT-compatible remote MCP endpoint for a single server-side configured SSH target.
+This project exposes a ChatGPT-compatible remote MCP endpoint for one or more server-side configured SSH targets.
 
 ## Architecture
 
@@ -8,10 +8,10 @@ This project exposes a ChatGPT-compatible remote MCP endpoint for a single serve
 ChatGPT
   -> HTTPS /mcp
   -> ssh-mcp-chatgpt HTTP adapter
-  -> SSH target configured by server environment
+  -> SSH profile configured by server environment
 ```
 
-The ChatGPT-facing service does not ask for SSH hostnames, passwords, private keys, or sudo passwords at tool-call time. Those values are deployment secrets.
+The ChatGPT-facing service does not ask for SSH hostnames, passwords, private keys, or sudo passwords at tool-call time. Those values are deployment secrets. Multi-VPS routing is handled by read-only server-side profiles: ChatGPT can call `list-profiles` to see safe profile IDs and labels, then pass `target_id` to `exec` or `sudo-exec`.
 
 ## Required Public Endpoints
 
@@ -48,7 +48,16 @@ SSH_MCP_DATA_DIR=/srv/ssh-mcp-chatgpt/data
 SSH_MCP_TOOL_CALL_LOG_ENABLED=1
 ```
 
-Use a dedicated, low-privilege SSH user. Enable `sudo-exec` only for deployments that truly need it.
+For multi-target deployments, replace the single-target `SSH_MCP_HOST` settings with a server-side profile file or inline profile JSON:
+
+```env
+SSH_MCP_PROFILES_FILE=/run/secrets/ssh-mcp-profiles.json
+SSH_MCP_DEFAULT_PROFILE=dev
+```
+
+Profile config must contain at least one profile. Empty profile files or inline JSON fail startup instead of falling back to any legacy single-target SSH environment variables that may still be present.
+
+Use a dedicated, low-privilege SSH user for each profile. Enable `sudo-exec` only for deployments and profiles that truly need it. `SSH_MCP_DISABLE_SUDO=1` remains a global kill switch even when a profile has `sudo_enabled: true`.
 
 ## Deploy
 
@@ -141,12 +150,14 @@ curl -sS https://<your-domain>/mcp \
 
 - Use `note` to describe why each command is being run.
 - Do not ask users to paste SSH credentials into ChatGPT.
+- Call `list-profiles` before selecting a non-default target. It returns only profile IDs, labels, default state, and sudo availability.
+- Pass `target_id` to `exec` and `sudo-exec` when choosing a non-default profile. If the deployment has no default profile, `target_id` is required.
 - Prefer short, inspectable commands.
 - Use `exec` by default.
 - If `exec` returns `status: "running"`, keep the returned `job_id` and poll with `exec-status` until it reaches `completed`, `failed`, `killed`, or `cancelled`. If the status is `cancelling` or `kill_requested`, the stop was requested but the SSH channel has not yet confirmed the final terminal status.
 - Use `exec-cancel` when a still-running background job should be stopped before its configured `kill_time_ms`, then keep polling with `exec-status`.
 - Large stdout/stderr are retained as a bounded tail controlled by `SSH_MCP_EXEC_OUTPUT_MAX_CHARS`; check `stdout_truncated` and `stderr_truncated` in tool output.
-- Use `sudo-exec` only when the deployment has explicitly enabled it and the task requires privilege.
+- Use `sudo-exec` only when the deployment has explicitly enabled it, the selected profile allows sudo, and the task requires privilege.
 - If a command might be destructive, ask the user for confirmation before running it.
 
 ## Troubleshooting
@@ -157,10 +168,13 @@ curl -sS https://<your-domain>/mcp \
 | OAuth discovery fails | Confirm both `.well-known` endpoints return JSON and `OAUTH_BASE_URL` has no trailing slash. |
 | Tool calls return 401 | Reauthorize the connector or check `OAUTH_LOGIN_SECRET` and token exchange. |
 | Tool list works but calls fail | Check SSH target env vars and audit logs under `SSH_MCP_DATA_DIR/tool-calls/`. |
+| `target_id is required` | Configure `SSH_MCP_DEFAULT_PROFILE`, mark exactly one profile as `default`, or pass `target_id` from `list-profiles`. |
+| `Unknown SSH target_id` | Refresh connector metadata if needed, call `list-profiles`, and use one of the returned profile IDs. |
 | Long deployment still running | Use `exec-status` with the returned `job_id`; stderr is output, while exit code and signal determine failure. |
 | Sudo tool missing | `SSH_MCP_DISABLE_SUDO=1` hides `sudo-exec`; this is the recommended default. |
+| Sudo rejected for one profile | The selected profile must set `sudo_enabled: true`; the global sudo switch must also allow sudo. |
 | Accept header error | MCP POST requests must include `Accept: application/json, text/event-stream`. |
 
 ## Scope
 
-This connector is command/tool only. It does not currently provide a ChatGPT iframe UI resource. If a visual SSH session, host selector, or log viewer is needed later, add an Apps SDK UI resource and set the relevant UI metadata on the tool descriptor.
+This connector is command/tool only. It does not currently provide a ChatGPT iframe UI resource. If a visual SSH session, profile selector, or log viewer is needed later, add an Apps SDK UI resource and set the relevant UI metadata on the tool descriptor.

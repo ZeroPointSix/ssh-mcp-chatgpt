@@ -18,12 +18,13 @@ It keeps the existing stdio CLI for local MCP clients and adds a remote HTTP ent
 | Tool | Description |
 | ---- | ----------- |
 | `health` | Returns non-secret service status and deployment capabilities. |
-| `exec` | Executes a shell command on the server-side configured SSH target. Long commands return a `job_id` after `expire_time_ms` and keep running in the background. |
-| `sudo-exec` | Executes a shell command through sudo when enabled server-side, with the same background job behavior. |
+| `list-profiles` | Lists read-only, non-secret SSH profile IDs, labels, default state, and sudo availability. |
+| `exec` | Executes a shell command on a server-side configured SSH profile. Long commands return a `job_id` after `expire_time_ms` and keep running in the background. |
+| `sudo-exec` | Executes a shell command through sudo when enabled globally and for the selected profile, with the same background job behavior. |
 | `exec-status` | Polls stdout, stderr, exit status, and progress for a background `job_id`. |
 | `exec-cancel` | Requests cancellation for a running background `job_id`; poll `exec-status` until the final status is confirmed. |
 
-The SSH target is intentionally server-side configuration. ChatGPT should not choose arbitrary hosts or receive raw credentials from a user prompt.
+SSH targets are intentionally server-side configuration. ChatGPT should not choose arbitrary hosts or receive raw credentials from a user prompt. Use `list-profiles` to discover configured profile IDs and pass `target_id` to `exec` or `sudo-exec`. If a default profile is configured, `target_id` may be omitted; otherwise the tool returns a clear missing-target error. Profiles are read-only at runtime and there are no profile CRUD tools.
 
 `exec` and `sudo-exec` return `status: "completed"` when the command finishes quickly. If the command is still running after `expire_time_ms`, they return `status: "running"` and a `job_id`; call `exec-status` with that ID until the job reaches `completed`, `failed`, `killed`, or `cancelled`. `exec-cancel` and `kill_time_ms` first move a job to `cancelling` or `kill_requested`; keep polling until the SSH channel confirms the final terminal status. Stderr is returned as command output and does not by itself make the tool fail; the remote exit code and signal determine the command status. Long-running stdout/stderr are retained as a bounded tail and report truncation metadata.
 
@@ -55,6 +56,8 @@ SSH_MCP_USER=deploy
 SSH_MCP_PRIVATE_KEY=-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----
 SSH_MCP_DISABLE_SUDO=1
 ```
+
+For multi-VPS routing, configure `SSH_MCP_PROFILES_FILE` or `SSH_MCP_PROFILES_JSON` instead of the single-target `SSH_MCP_HOST` fallback. `exec`, `sudo-exec`, background job status, and audit logs all report the resolved `target_id`.
 
 3. Start the HTTP server:
 
@@ -138,9 +141,12 @@ Example MCP client config:
 | `OAUTH_LOGIN_SECRET` | Human-entered secret required on `/authorize`. |
 | `SSH_MCP_HTTP_TOKEN` / `MCP_TOKEN` | Optional static bearer token for non-ChatGPT API clients. |
 | `ALLOWED_ORIGINS` | Comma-separated browser origins allowed for `/mcp`. |
-| `SSH_MCP_HOST` / `SSH_HOST` | SSH target host. |
-| `SSH_MCP_PORT` / `SSH_PORT` | SSH target port, default `22`. |
-| `SSH_MCP_USER` / `SSH_USER` | SSH username. |
+| `SSH_MCP_PROFILES_FILE` | Optional path to a JSON file with multiple server-side SSH profiles. Preferred for multi-target deployments. |
+| `SSH_MCP_PROFILES_JSON` | Optional inline JSON profile configuration. Used only when `SSH_MCP_PROFILES_FILE` is not set. |
+| `SSH_MCP_DEFAULT_PROFILE` / `SSH_MCP_DEFAULT_PROFILE_ID` | Optional default profile ID used when a tool call omits `target_id`. If unset and no profile is marked default, callers must pass `target_id`. |
+| `SSH_MCP_HOST` / `SSH_HOST` | Legacy single-target fallback host, used only when no profile config is provided. |
+| `SSH_MCP_PORT` / `SSH_PORT` | Legacy single-target fallback port, default `22`. |
+| `SSH_MCP_USER` / `SSH_USER` | Legacy single-target fallback username. |
 | `SSH_MCP_PASSWORD` / `SSH_PASSWORD` | Optional SSH password. Prefer key auth in production. |
 | `SSH_MCP_PRIVATE_KEY` / `SSH_PRIVATE_KEY` | Optional private key content. Escaped `\n` sequences are supported. |
 | `SSH_MCP_KEY` / `SSH_KEY` | Optional path to a mounted private key file. |
@@ -153,6 +159,40 @@ Example MCP client config:
 | `SSH_MCP_DATA_DIR` | Data directory for redacted audit logs. |
 | `SSH_MCP_TOOL_CALL_LOG_ENABLED` | Set `0` to disable audit logging. |
 | `SSH_MCP_TOOL_CALL_NOTE_REQUIRED` | Set `1` to require `note` on tool calls. |
+
+### SSH Profiles
+
+Profile JSON may be an object with `profiles` and an optional `default`, or an array of profiles. Object maps are also accepted. Each profile supports `id`, `label` or `name`, `host`, `port`, `user` or `username`, `password`, `private_key`, `private_key_path`, `sudo_enabled`, and `default`. Hostnames and credentials never appear in `list-profiles`, `health`, tool descriptions, or audit arguments.
+
+If `SSH_MCP_PROFILES_FILE` or `SSH_MCP_PROFILES_JSON` is set, the profile config must contain at least one profile. Empty profile configs such as `[]`, `{ "profiles": [] }`, or `{ "profiles": {} }` fail startup instead of silently falling back to the legacy single-target env.
+
+Example `profiles.json`:
+
+```json
+{
+  "default": "dev",
+  "profiles": [
+    {
+      "id": "dev",
+      "label": "Development VPS",
+      "host": "dev.example.com",
+      "user": "deploy",
+      "private_key_path": "/run/secrets/dev_key",
+      "sudo_enabled": false
+    },
+    {
+      "id": "ops",
+      "label": "Operations VPS",
+      "host": "ops.example.com",
+      "user": "deploy",
+      "password": "change-me-in-secret-store",
+      "sudo_enabled": true
+    }
+  ]
+}
+```
+
+`SSH_MCP_DISABLE_SUDO=1` is still a global kill switch: it hides `sudo-exec` even when a profile has `sudo_enabled: true`. When the global switch is off, `sudo-exec` still requires the resolved profile to opt in with `sudo_enabled: true`.
 
 ## Development
 
@@ -178,6 +218,7 @@ curl -sS \
 
 - Keep SSH credentials in server environment variables or mounted secret files.
 - Prefer a dedicated low-privilege SSH user and disable `sudo-exec` by default.
+- Use server-side profiles for multi-VPS routing; do not expose profile CRUD or raw host details to ChatGPT.
 - Keep `SSH_MCP_MAX_CHARS`, `SSH_MCP_EXEC_KILL_TIME_MS`, and `SSH_MCP_EXEC_OUTPUT_MAX_CHARS` bounded for ChatGPT-facing deployments when your environment needs stricter guardrails.
 - Review redacted audit logs in `SSH_MCP_DATA_DIR/tool-calls/` when investigating tool use.
 - Use OAuth for ChatGPT connector setup. Static bearer tokens are best reserved for direct API clients and operations.

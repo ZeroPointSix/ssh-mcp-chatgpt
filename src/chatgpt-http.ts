@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { createServer, type IncomingHttpHeaders, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
@@ -22,8 +23,9 @@ const DEFAULT_EXEC_OUTPUT_MAX_CHARS = 200_000;
 const COMMAND_JOB_RETENTION_MS = 24 * 60 * 60 * 1000;
 
 const SERVER_INSTRUCTIONS = [
-  "This connector executes shell commands on one server-side configured SSH target.",
-  "Do not ask the user to paste SSH passwords, private keys, or host credentials into ChatGPT; credentials are configured on the server with environment variables.",
+  "This connector executes shell commands on server-side configured SSH profiles.",
+  "Use list-profiles to see the available profile IDs and labels before selecting a non-default target.",
+  "Do not ask the user to paste SSH passwords, private keys, hostnames, or host credentials into ChatGPT; credentials and routing details are configured on the server.",
   "Use the optional note argument on tool calls to explain why a command is being run. It is written to a redacted audit log when logging is enabled.",
   "Long-running commands return a job_id after expire_time_ms and continue in the background. Use exec-status to poll and exec-cancel to request stopping, then poll until a final status is confirmed.",
   "Prefer precise, non-interactive commands. Ask for confirmation before destructive operations.",
@@ -55,7 +57,38 @@ interface RuntimeConfig {
   execExpireTimeMs: number;
   execKillTimeMs?: number;
   execOutputMaxChars: number;
+  sshProfiles: SshProfileConfig[];
+  defaultSshProfileId?: string;
 }
+
+interface SshProfileConfig {
+  id: string;
+  label: string;
+  host: string;
+  port: number;
+  username: string;
+  password?: string;
+  privateKey?: string;
+  privateKeyPath?: string;
+  sudoEnabled: boolean;
+  default: boolean;
+}
+
+interface PublicSshProfile {
+  id: string;
+  label: string;
+  sudo_enabled: boolean;
+  default: boolean;
+}
+
+interface ResolvedSshTarget {
+  id: string;
+  label: string;
+  sudoEnabled: boolean;
+  profile?: SshProfileConfig;
+}
+
+const LEGACY_TARGET_ID = "default";
 
 type CommandTool = "exec" | "sudo-exec";
 type CommandJobTerminalStatus = "completed" | "failed" | "killed" | "cancelled";
@@ -65,6 +98,8 @@ type CommandJobStatus = "running" | "cancelling" | "kill_requested" | CommandJob
 interface CommandJob {
   id: string;
   tool: CommandTool;
+  targetId: string;
+  targetLabel: string;
   commandLength: number;
   status: CommandJobStatus;
   createdAt: number;
@@ -303,9 +338,179 @@ function isEnabled(value: string | undefined, defaultValue: boolean): boolean {
   return !["0", "false", "no", "off"].includes(value.toLowerCase());
 }
 
+function parseProfilesJson(raw: string, sourceName: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "invalid JSON";
+    throw new AppError(500, `${sourceName} must contain valid JSON: ${message}`, "CONFIG_INVALID");
+  }
+}
+
+function objectRecord(value: unknown, name: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new AppError(500, `${name} must be a JSON object`, "CONFIG_INVALID");
+  }
+  return value as Record<string, unknown>;
+}
+
+function profileString(raw: Record<string, unknown>, names: string[]): string | undefined {
+  for (const name of names) {
+    const value = raw[name];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return undefined;
+}
+
+function profileRawString(raw: Record<string, unknown>, names: string[]): string | undefined {
+  for (const name of names) {
+    const value = raw[name];
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return undefined;
+}
+
+function profileBoolean(raw: Record<string, unknown>, names: string[], fallback: boolean): boolean {
+  for (const name of names) {
+    const value = raw[name];
+    if (typeof value === "boolean") return value;
+    if (typeof value === "string" && value.trim()) return isEnabled(value.trim(), fallback);
+  }
+  return fallback;
+}
+
+function profilePort(raw: Record<string, unknown>, profileId: string): number {
+  const value = raw.port;
+  if (value === undefined || value === null || value === "") return 22;
+  const parsed = typeof value === "number" ? value : Number.parseInt(String(value), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new AppError(500, `SSH profile ${profileId} port must be a positive integer`, "CONFIG_INVALID");
+  }
+  return Math.floor(parsed);
+}
+
+function loadRawProfilesConfig(): unknown | undefined {
+  const filePath = getEnv("SSH_MCP_PROFILES_FILE");
+  if (filePath) {
+    try {
+      return parseProfilesJson(readFileSync(filePath, "utf8"), "SSH_MCP_PROFILES_FILE");
+    } catch (error) {
+      if (error instanceof AppError) throw error;
+      const message = error instanceof Error ? error.message : "read failed";
+      throw new AppError(500, `Failed to read SSH_MCP_PROFILES_FILE: ${message}`, "CONFIG_INVALID");
+    }
+  }
+
+  const inlineJson = getRawEnv("SSH_MCP_PROFILES_JSON");
+  if (inlineJson) return parseProfilesJson(inlineJson, "SSH_MCP_PROFILES_JSON");
+  return undefined;
+}
+
+function rawProfileEntries(raw: unknown): { entries: Array<[string | undefined, Record<string, unknown>]>; defaultProfileId?: string } {
+  if (Array.isArray(raw)) {
+    return { entries: raw.map((item) => [undefined, objectRecord(item, "SSH profile")]) };
+  }
+
+  const config = objectRecord(raw, "SSH profile config");
+  const defaultProfileId = profileString(config, ["default", "default_profile_id", "defaultProfileId"]);
+  const profiles = config.profiles;
+  if (Array.isArray(profiles)) {
+    return { entries: profiles.map((item) => [undefined, objectRecord(item, "SSH profile")]), defaultProfileId };
+  }
+  if (profiles && typeof profiles === "object" && !Array.isArray(profiles)) {
+    return {
+      entries: Object.entries(profiles as Record<string, unknown>).map(([id, item]) => [id, objectRecord(item, `SSH profile ${id}`)]),
+      defaultProfileId,
+    };
+  }
+
+  throw new AppError(500, "SSH profile config must be an array or an object with a profiles array/object", "CONFIG_INVALID");
+}
+
+function parseSshProfiles(): { profiles: SshProfileConfig[]; defaultSshProfileId?: string } {
+  const raw = loadRawProfilesConfig();
+  if (raw === undefined) return { profiles: [] };
+
+  const { entries, defaultProfileId: configuredDefault } = rawProfileEntries(raw);
+  if (entries.length === 0) {
+    throw new AppError(500, "SSH profile config must include at least one profile", "CONFIG_INVALID");
+  }
+
+  const profiles: SshProfileConfig[] = [];
+  const seen = new Set<string>();
+  const markedDefaults: string[] = [];
+
+  for (const [entryId, profileRaw] of entries) {
+    const id = profileString(profileRaw, ["id"]) ?? entryId?.trim();
+    if (!id) throw new AppError(500, "Each SSH profile must have a non-empty id", "CONFIG_INVALID");
+    if (seen.has(id)) throw new AppError(500, `Duplicate SSH profile id: ${id}`, "CONFIG_INVALID");
+    seen.add(id);
+
+    const host = profileString(profileRaw, ["host"]);
+    const username = profileString(profileRaw, ["username", "user"]);
+    if (!host || !username) {
+      throw new AppError(500, `SSH profile ${id} must include host and user/username`, "CONFIG_INVALID");
+    }
+
+    const isDefault = profileBoolean(profileRaw, ["default"], false);
+    if (isDefault) markedDefaults.push(id);
+    profiles.push({
+      id,
+      label: profileString(profileRaw, ["label", "name"]) ?? id,
+      host,
+      port: profilePort(profileRaw, id),
+      username,
+      password: profileRawString(profileRaw, ["password"]),
+      privateKey: profileRawString(profileRaw, ["private_key", "privateKey"])?.replace(/\\n/g, "\n"),
+      privateKeyPath: profileString(profileRaw, ["private_key_path", "privateKeyPath", "key"]),
+      sudoEnabled: profileBoolean(profileRaw, ["sudo_enabled", "sudoEnabled"], false),
+      default: false,
+    });
+  }
+
+  if (markedDefaults.length > 1) {
+    throw new AppError(500, `Only one SSH profile can be marked default: ${markedDefaults.join(", ")}`, "CONFIG_INVALID");
+  }
+
+  const envDefault = getEnv("SSH_MCP_DEFAULT_PROFILE", "SSH_MCP_DEFAULT_PROFILE_ID");
+  const defaultSshProfileId = envDefault ?? configuredDefault ?? markedDefaults[0];
+  if (defaultSshProfileId && !seen.has(defaultSshProfileId)) {
+    throw new AppError(500, `Default SSH profile does not exist: ${defaultSshProfileId}`, "CONFIG_INVALID");
+  }
+  for (const profile of profiles) profile.default = profile.id === defaultSshProfileId;
+
+  return { profiles, defaultSshProfileId };
+}
+
+function isLegacySshTargetConfigured(): boolean {
+  return Boolean(getEnv("SSH_MCP_HOST", "SSH_HOST") && getEnv("SSH_MCP_USER", "SSH_USER"));
+}
+
+function publicSshProfiles(config: RuntimeConfig): PublicSshProfile[] {
+  if (config.sshProfiles.length > 0) {
+    return config.sshProfiles.map((profile) => ({
+      id: profile.id,
+      label: profile.label,
+      sudo_enabled: !config.disableSudo && profile.sudoEnabled,
+      default: profile.default,
+    }));
+  }
+
+  if (!isLegacySshTargetConfigured()) return [];
+  return [
+    {
+      id: LEGACY_TARGET_ID,
+      label: "Default SSH target",
+      sudo_enabled: !config.disableSudo,
+      default: true,
+    },
+  ];
+}
+
 function loadRuntimeConfig(): RuntimeConfig {
   const oauthBaseUrl = getEnv("OAUTH_BASE_URL", "SSH_MCP_OAUTH_BASE_URL")?.replace(/\/+$/, "");
   const oauthLoginSecret = getRawEnv("OAUTH_LOGIN_SECRET", "SSH_MCP_OAUTH_LOGIN_SECRET");
+  const sshProfileConfig = parseSshProfiles();
 
   if (oauthBaseUrl && !oauthLoginSecret) {
     throw new AppError(
@@ -342,6 +547,8 @@ function loadRuntimeConfig(): RuntimeConfig {
     execOutputMaxChars: parseOutputMaxChars(
       getEnv("SSH_MCP_EXEC_OUTPUT_MAX_CHARS", "SSH_MCP_OUTPUT_MAX_CHARS", "EXEC_OUTPUT_MAX_CHARS"),
     ),
+    sshProfiles: sshProfileConfig.profiles,
+    defaultSshProfileId: sshProfileConfig.defaultSshProfileId,
   };
 }
 
@@ -601,6 +808,8 @@ function commandJobPayload(job: CommandJob): JsonObject {
   const payload: JsonObject = {
     status: job.status,
     tool: job.tool,
+    target_id: job.targetId,
+    target_label: job.targetLabel,
     job_id: job.id,
     stdout: job.stdout,
     stderr: job.stderr,
@@ -694,6 +903,7 @@ function requestStopCommandJob(job: CommandJob, status: CommandJobStopStatus, er
 
 function startSshCommandJob(
   tool: CommandTool,
+  target: ResolvedSshTarget,
   sshConfig: SSHConfig,
   remoteCommand: string,
   commandLength: number,
@@ -704,6 +914,8 @@ function startSshCommandJob(
   const job: CommandJob = {
     id: `job-${randomToken(12)}`,
     tool,
+    targetId: target.id,
+    targetLabel: target.label,
     commandLength,
     status: "running",
     createdAt: Date.now(),
@@ -795,7 +1007,53 @@ function waitForCommandJob(job: CommandJob, expireTimeMs: number): Promise<Comma
   });
 }
 
-async function loadSshConfig(): Promise<SSHConfig> {
+function resolveSshTarget(args: JsonObject, config: RuntimeConfig): ResolvedSshTarget {
+  const requestedTargetId = optionalString(args.target_id);
+
+  if (config.sshProfiles.length > 0) {
+    const targetId = requestedTargetId ?? config.defaultSshProfileId;
+    if (!targetId) {
+      throw new AppError(400, "target_id is required because no default SSH profile is configured", "TARGET_REQUIRED");
+    }
+    const profile = config.sshProfiles.find((candidate) => candidate.id === targetId);
+    if (!profile) throw new AppError(400, `Unknown SSH target_id: ${targetId}`, "TARGET_NOT_FOUND");
+    return {
+      id: profile.id,
+      label: profile.label,
+      sudoEnabled: profile.sudoEnabled,
+      profile,
+    };
+  }
+
+  if (requestedTargetId && requestedTargetId !== LEGACY_TARGET_ID) {
+    throw new AppError(400, `Unknown SSH target_id: ${requestedTargetId}`, "TARGET_NOT_FOUND");
+  }
+  return {
+    id: LEGACY_TARGET_ID,
+    label: "Default SSH target",
+    sudoEnabled: true,
+  };
+}
+
+async function loadProfileSshConfig(profile: SshProfileConfig): Promise<SSHConfig> {
+  const config: SSHConfig = {
+    host: profile.host,
+    port: profile.port,
+    username: profile.username,
+  };
+  if (profile.password) {
+    config.password = profile.password;
+  } else if (profile.privateKey) {
+    config.privateKey = profile.privateKey;
+  } else if (profile.privateKeyPath) {
+    config.privateKey = await readFile(profile.privateKeyPath, "utf8");
+  }
+  return config;
+}
+
+async function loadSshConfig(target: ResolvedSshTarget): Promise<SSHConfig> {
+  if (target.profile) return loadProfileSshConfig(target.profile);
+
   const host = getEnv("SSH_MCP_HOST", "SSH_HOST");
   const user = getEnv("SSH_MCP_USER", "SSH_USER");
   if (!host || !user) {
@@ -827,7 +1085,7 @@ async function loadSshConfig(): Promise<SSHConfig> {
   return config;
 }
 
-async function runSshTool(name: "exec" | "sudo-exec", args: JsonObject, config: RuntimeConfig): Promise<JsonObject> {
+async function runSshTool(name: "exec" | "sudo-exec", args: JsonObject, config: RuntimeConfig, target: ResolvedSshTarget): Promise<JsonObject> {
   const command = sanitizeCommand(requireString(args.command, "command"), config.maxChars);
   const description = optionalString(args.description);
   const commandWithDescription = appendDescription(command, description);
@@ -839,6 +1097,9 @@ async function runSshTool(name: "exec" | "sudo-exec", args: JsonObject, config: 
     if (config.disableSudo) {
       throw new AppError(403, "sudo-exec is disabled on this deployment", "SUDO_DISABLED");
     }
+    if (!target.sudoEnabled) {
+      throw new AppError(403, `sudo-exec is disabled for SSH target ${target.id}`, "SUDO_DISABLED");
+    }
     const quotedCommand = shellSingleQuote(commandWithDescription);
     if (config.sudoPassword) {
       remoteCommand = `printf '%s\\n' '${shellSingleQuote(config.sudoPassword)}' | sudo -p "" -S sh -c '${quotedCommand}'`;
@@ -847,9 +1108,10 @@ async function runSshTool(name: "exec" | "sudo-exec", args: JsonObject, config: 
     }
   }
 
-  const sshConfig = await loadSshConfig();
+  const sshConfig = await loadSshConfig(target);
   const job = startSshCommandJob(
     name,
+    target,
     sshConfig,
     remoteCommand,
     command.length,
@@ -877,6 +1139,10 @@ function runCommandCancelTool(args: JsonObject): JsonObject {
   const job = getCommandJob(args);
   requestStopCommandJob(job, "cancelled", "Command cancellation requested by exec-cancel");
   return commandJobPayload(job);
+}
+
+function listProfilesTool(config: RuntimeConfig): JsonObject {
+  return { profiles: publicSshProfiles(config) };
 }
 
 function redactArgs(args: JsonObject): JsonObject {
@@ -914,6 +1180,14 @@ async function auditToolCall(tool: string, args: JsonObject, sessionId: string, 
   await appendFile(join(dir, `${now.toISOString().slice(0, 10)}.jsonl`), `${JSON.stringify(record)}\n`, "utf8");
 }
 
+function commandAuditArgs(args: JsonObject, target: ResolvedSshTarget): JsonObject {
+  return {
+    ...args,
+    target_id: target.id,
+    target_label: target.label,
+  };
+}
+
 function schema(properties: JsonObject, required: string[] = []): JsonObject {
   return {
     type: "object",
@@ -949,6 +1223,9 @@ const HEALTH_OUTPUT_SCHEMA: JsonObject = {
     default_kill_time_ms: { anyOf: [{ type: "number" }, { type: "string", enum: ["none"] }] },
     active_background_jobs: { type: "number" },
     ssh_target_configured: { type: "boolean" },
+    ssh_profiles_configured: { type: "boolean" },
+    ssh_profile_count: { type: "number" },
+    default_ssh_profile_id: { anyOf: [{ type: "string" }, { type: "null" }] },
   },
   required: [
     "status",
@@ -967,7 +1244,32 @@ const HEALTH_OUTPUT_SCHEMA: JsonObject = {
     "default_kill_time_ms",
     "active_background_jobs",
     "ssh_target_configured",
+    "ssh_profiles_configured",
+    "ssh_profile_count",
+    "default_ssh_profile_id",
   ],
+  additionalProperties: false,
+};
+
+const LIST_PROFILES_OUTPUT_SCHEMA: JsonObject = {
+  type: "object",
+  properties: {
+    profiles: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          id: { type: "string" },
+          label: { type: "string" },
+          sudo_enabled: { type: "boolean" },
+          default: { type: "boolean" },
+        },
+        required: ["id", "label", "sudo_enabled", "default"],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ["profiles"],
   additionalProperties: false,
 };
 
@@ -976,6 +1278,8 @@ const COMMAND_OUTPUT_SCHEMA: JsonObject = {
   properties: {
     status: { type: "string", enum: ["running", "cancelling", "kill_requested", "completed", "failed", "killed", "cancelled"] },
     tool: { type: "string", enum: ["exec", "sudo-exec"] },
+    target_id: { type: "string" },
+    target_label: { type: "string" },
     job_id: { type: "string" },
     stdout: { type: "string" },
     stderr: { type: "string" },
@@ -1017,6 +1321,12 @@ function withSecurity(tool: JsonObject, securitySchemes: JsonObject[]): JsonObje
   };
 }
 
+const TARGET_ID_INPUT_SCHEMA: JsonObject = {
+  type: "string",
+  description:
+    "Optional server-side SSH profile ID. Required when no default profile is configured. Do not pass hostnames or credential material here.",
+};
+
 function listTools(config: RuntimeConfig): JsonObject[] {
   const noAuth = [{ type: "noauth" }];
   const protectedSchemes = config.oauthBaseUrl ? [{ type: "oauth2", scopes: ["mcp"] }] : noAuth;
@@ -1034,12 +1344,24 @@ function listTools(config: RuntimeConfig): JsonObject[] {
     ),
     withSecurity(
       {
+        name: "list-profiles",
+        description:
+          "List non-sensitive server-side SSH profile metadata: profile IDs, labels, default marker, and sudo availability. Does not return hostnames, usernames, credential paths, passwords, private keys, or other connection details.",
+        inputSchema: schema({}),
+        outputSchema: LIST_PROFILES_OUTPUT_SCHEMA,
+        annotations: { readOnlyHint: true },
+      },
+      protectedSchemes,
+    ),
+    withSecurity(
+      {
         name: "exec",
         description:
-          "Execute a shell command on the server-side configured SSH target. If the command exceeds expire_time_ms, the tool returns a running job_id while the command continues in the background. Use exec-status to poll it. Output is retained as a bounded tail by deployment configuration. Credentials and target host are configured by the deployment, not by ChatGPT. Ask for confirmation before running destructive commands.",
+          "Execute a shell command on a server-side configured SSH profile. Use list-profiles to see available profile IDs and labels. Pass target_id to select a profile, or omit it only when the deployment has a default profile. If no default profile is configured, target_id is required. Do not pass hostnames, passwords, private keys, or credential material in tool arguments. If the command exceeds expire_time_ms, the tool returns a running job_id while the command continues in the background. Use exec-status to poll it. Ask for confirmation before running destructive commands.",
         inputSchema: schema(
           {
-            command: { type: "string", minLength: 1, description: "Shell command to execute on the configured SSH target." },
+            target_id: TARGET_ID_INPUT_SCHEMA,
+            command: { type: "string", minLength: 1, description: "Shell command to execute on the selected SSH profile." },
             description: { type: "string", description: "Optional legacy command comment appended on the remote shell." },
             expire_time_ms: { type: "number", description: "Optional time to wait before returning a running job_id. Defaults to deployment configuration." },
             kill_time_ms: { anyOf: [{ type: "number" }, { type: "string", enum: ["none"] }], description: "Optional hard deadline for killing the background command. Defaults to deployment configuration; none disables the hard deadline." },
@@ -1087,10 +1409,11 @@ function listTools(config: RuntimeConfig): JsonObject[] {
         {
           name: "sudo-exec",
           description:
-            "Execute a bounded shell command through sudo on the server-side configured SSH target. Sudo credentials, when needed, are configured server-side. Ask for confirmation before running destructive commands.",
+            "Execute a bounded shell command through sudo on a server-side configured SSH profile. Use list-profiles to see available profile IDs, labels, and sudo availability. Pass target_id to select a profile, or omit it only when the deployment has a default profile. The resolved profile must allow sudo and the global sudo kill switch must be enabled. Do not pass hostnames, passwords, private keys, or credential material in tool arguments. Ask for confirmation before running destructive commands.",
           inputSchema: schema(
             {
-              command: { type: "string", minLength: 1, description: "Shell command to execute with sudo." },
+              target_id: TARGET_ID_INPUT_SCHEMA,
+              command: { type: "string", minLength: 1, description: "Shell command to execute with sudo on the selected SSH profile." },
               description: { type: "string", description: "Optional legacy command comment appended on the remote shell." },
               expire_time_ms: { type: "number", description: "Optional time to wait before returning a running job_id. Defaults to deployment configuration." },
               kill_time_ms: { anyOf: [{ type: "number" }, { type: "string", enum: ["none"] }], description: "Optional hard deadline for killing the background command. Defaults to deployment configuration; none disables the hard deadline." },
@@ -1112,6 +1435,7 @@ function listTools(config: RuntimeConfig): JsonObject[] {
 }
 
 function healthPayload(config: RuntimeConfig): JsonObject {
+  const profiles = publicSshProfiles(config);
   return {
     status: "ok",
     name: SERVER_NAME,
@@ -1128,14 +1452,22 @@ function healthPayload(config: RuntimeConfig): JsonObject {
     default_expire_time_ms: config.execExpireTimeMs,
     default_kill_time_ms: config.execKillTimeMs ?? "none",
     active_background_jobs: [...commandJobs.values()].filter((job) => isActiveJobStatus(job.status)).length,
-    ssh_target_configured: Boolean(getEnv("SSH_MCP_HOST", "SSH_HOST") && getEnv("SSH_MCP_USER", "SSH_USER")),
+    ssh_target_configured: profiles.length > 0,
+    ssh_profiles_configured: config.sshProfiles.length > 0,
+    ssh_profile_count: profiles.length,
+    default_ssh_profile_id: config.sshProfiles.length > 0 ? config.defaultSshProfileId ?? null : (profiles[0]?.id ?? null),
   };
 }
 
 async function invokeTool(name: string, args: JsonObject, sessionId: string, config: RuntimeConfig): Promise<JsonObject> {
+  if (name === "exec" || name === "sudo-exec") {
+    const target = resolveSshTarget(args, config);
+    await auditToolCall(name, commandAuditArgs(args, target), sessionId, config);
+    return runSshTool(name, args, config, target);
+  }
   await auditToolCall(name, args, sessionId, config);
   if (name === "health") return healthPayload(config);
-  if (name === "exec" || name === "sudo-exec") return runSshTool(name, args, config);
+  if (name === "list-profiles") return listProfilesTool(config);
   if (name === "exec-status") return runCommandStatusTool(args);
   if (name === "exec-cancel") return runCommandCancelTool(args);
   throw new AppError(404, `Unknown tool: ${name}`, "UNKNOWN_TOOL");
