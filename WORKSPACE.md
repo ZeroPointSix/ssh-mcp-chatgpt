@@ -1,4 +1,4 @@
-# WORKSPACE
+﻿# WORKSPACE
 
 ## 2026-06-20（ssh OAuth「OAuth is not configured」→ 容器 env 丢失，已修）
 
@@ -281,3 +281,4 @@
 - User: **「结束当前对话」** — session ends here; no further agent work unless a new session starts.
 - **Agent ops preferences** (user, same session — for future sessions): use **寸止 MCP** for user comms; end only on user say-so; long jobs via **Start-Process** / background; subagents when only **conclusions** needed; model routing (explore → gpt 5.4 mini; UI → gemini 3.1 Pro / sonnet 4.6; backend explore → sonnet 4.6 / gpt 5.4; heavy reasoning → opus 4.6; small tasks → gpt 5.4 mini); **full context before each action**.
 - **Handoff:** local `master` at **`e58cbb4`**; session trace in `docs/workspace/2026-06-18-local-pull-and-session-docs.md`.
+- **Git push**：origin/master → **ce45718**（本批文档/脚本）；workmust **dc84fc5**（docker.md）。
