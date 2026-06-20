@@ -52,7 +52,7 @@ For multi-target deployments, replace the single-target `SSH_MCP_HOST` settings 
 
 ```env
 SSH_MCP_PROFILES_FILE=/run/secrets/ssh-mcp-profiles.json
-SSH_MCP_DEFAULT_PROFILE=dev
+SSH_MCP_DEFAULT_PROFILE=azure-kr-001
 ```
 
 Profile config must contain at least one profile. Empty profile files or inline JSON fail startup instead of falling back to any legacy single-target SSH environment variables that may still be present.
@@ -79,6 +79,75 @@ docker run -d --restart unless-stopped --name ssh-mcp-chatgpt \
 ```
 
 Place Nginx, Caddy, or a managed HTTPS load balancer in front of the container. ChatGPT must use the public HTTPS origin in `OAUTH_BASE_URL`.
+
+## Deployment reality (this fork)
+
+| Item | Value |
+| ---- | ----- |
+| Production public URL | `https://ssh.zerodotsix.top/mcp` |
+| Origin (2026-06-18) | Azure Korea **`20.196.72.18`**, hostname `B1sLinux`, OpenResty → `:3039` |
+| Legacy NYC standby | `137.184.23.118`, **nyc1** — no longer public DNS for this domain |
+| Korea deploy scripts | `setup-korea-ssh-zerodotsix.py`, `finish-korea-ssl-ssh-zerodotsix.py`, `sync-korea-oauth-clients.py` |
+| Connector verified | **2026-06-18** — OAuth on Korea origin after DNS migration |
+| Singapore droplet | `139.59.96.181` (**sgp1**) serves **`mcp.zerodotsix.top` (remote-dev-mcp)** — **not** ssh-mcp-chatgpt |
+
+Full host matrix: [DEPLOYMENT-HOSTS.md](./DEPLOYMENT-HOSTS.md).
+
+Production uses **multi-profile SSH routing** (`list-profiles`, `exec` with optional `target_id`). Details: [SSH-MCP-MULTI-PROFILE.md](./SSH-MCP-MULTI-PROFILE.md).
+
+### OAuth `/authorize` 帮助页（**不是**服务故障）
+
+在浏览器里**直接打开** `https://ssh.zerodotsix.top/authorize`（没有 ChatGPT 带过来的查询参数）时，页面会显示类似：
+
+```text
+SSH MCP OAuth
+缺少 OAuth 参数或 redirect_uri 未注册。这通常表示你尚未从 ChatGPT 发起授权。
+请通过 ChatGPT Connector 发起 OAuth 登录，不要直接在浏览器打开裸 /authorize 地址。
+Connector URL: https://ssh.zerodotsix.top/mcp
+```
+
+**这是正常行为**，不代表 ssh-mcp 挂了。`/health` 仍可返回 200。
+
+**正确授权路径（必须按顺序）：**
+
+1. 打开 **ChatGPT**（网页或客户端）→ **设置** → **应用与连接器**（Apps & Connectors）。
+2. 新建或选中连接器，**Connector URL** 填：`https://ssh.zerodotsix.top/mcp`（不要多空格、不要写成 `/authorize`）。
+3. 认证方式选 **OAuth**；在连接器里点 **连接 / 授权**（Connect / Authorize），让 ChatGPT 跳转到 `/authorize?client_id=…&redirect_uri=…&code_challenge=…`。
+4. 跳转成功后应出现 **登录密钥** 表单（服务器上的 `OAUTH_LOGIN_SECRET`），**不是**上面的帮助页。
+5. 授权完成后，工具调用使用 **`target_id` = `server_id`**（如 `azure-kr-001`）；先 `list-profiles`。默认 profile 为 **`azure-kr-001`**（不是已废弃的 `direct`）。
+
+**不要：** 把 `/authorize` 当书签打开、从文档里复制裸链接进浏览器、只测 `/mcp` 而不走 OAuth。
+
+**自检：**
+
+```bash
+curl -fsS https://ssh.zerodotsix.top/health
+curl -fsS https://ssh.zerodotsix.top/.well-known/oauth-authorization-server
+```
+
+**若 URL 已带齐 `client_id`、`redirect_uri`、`code_challenge` 仍显示帮助页：** 表示 **`redirect_uri` 未在该 `client_id` 下注册**（与「裸开 /authorize」不同）。服务端校验 `oauth-clients.json` 中 `clients[client_id]` 是否包含该 `https://chatgpt.com/connector/oauth/…` 地址。
+
+运维（韩国 `azure-kr-001`）：
+
+```bash
+python deploy/scripts/probe-korea-oauth-client.py   # 检查是否已登记
+python deploy/scripts/register-oauth-client-korea.py  # 登记当前 ChatGPT client（或改脚本内 CLIENT_ID/REDIRECT_URI）
+python deploy/scripts/sync-korea-oauth-clients.py     # 或从 137 同步整文件
+```
+
+登记后若改了 `oauth-clients.json`、**`SSH_MCP_DATA_DIR`**、**`OAUTH_*`** 或宿主机 **`/opt/ssh-mcp-chatgpt-korea/env`**，需 **`docker rm` + `docker run` 重建**（**`docker restart` 不会重新加载 `--env-file`**）。韩国生产数据目录必须为 **已挂载的** `/opt/ssh-mcp-chatgpt-korea/data`（与 `recreate-korea-ssh-mcp-container.py` 一致），**不要**只写 `/srv/ssh-mcp-chatgpt/data` 而未挂载进容器。
+
+成功时应出现 **登录密钥**（`name="secret"`）表单，而非帮助页。
+
+### `/authorize` 返回 500「OAuth is not configured」（**配置未进容器**）
+
+当 URL **已带齐** `client_id`、`redirect_uri`、`code_challenge` 时，若响应为 **纯文本** `OAuth is not configured`（HTTP **500**），表示进程内 **没有** `OAUTH_LOGIN_SECRET`（与「帮助页」不同）。同时 `/health` 往往为 **`oauth_enabled: false`**（未配置 `OAUTH_BASE_URL` 或未满足启动校验）。
+
+常见原因：**只做了 `docker restart`**；env 文件里变量名错误（例如 `OAUTH_OAUTH_LOGIN_SECRET`）；容器内 `OAUTH_BASE_URL` 为空。修复后须 **重建容器**，并用 `docker exec … env | grep OAUTH` 核对。
+
+运维脚本：`deploy/scripts/fix-korea-oauth-data-path.py`（env + 数据目录 + oauth-clients + 重建）。**给其它 Agent 的泛化说明**（适用于任意 `--env-file` 服务）：[DOCKER-ENV-FILE-RECREATE.md](./DOCKER-ENV-FILE-RECREATE.md)。
+
+也可在 ChatGPT 删除连接器后重新添加，使 `POST /register` 写入新 `client_id`（若动态注册可用）。
 
 ## ChatGPT Setup
 
@@ -166,7 +235,11 @@ curl -sS https://<your-domain>/mcp \
 | ------- | ----- |
 | ChatGPT cannot connect | Confirm `https://<domain>/health` is reachable from the public Internet. |
 | OAuth discovery fails | Confirm both `.well-known` endpoints return JSON and `OAUTH_BASE_URL` has no trailing slash. |
+| `/authorize` 500 `OAuth is not configured` | `/health` 中 `oauth_enabled: false` → 容器内缺 `OAUTH_LOGIN_SECRET` 或 `OAUTH_BASE_URL`；勿只 restart，见 [DOCKER-ENV-FILE-RECREATE.md](./DOCKER-ENV-FILE-RECREATE.md) 与 `fix-korea-oauth-data-path.py`。 |
+| 改 env 后 OAuth 仍像旧配置 | `docker restart` 不读 `--env-file` → `recreate-korea-ssh-mcp-container.py` 或 rm+run。 |
 | Tool calls return 401 | Reauthorize the connector or check `OAUTH_LOGIN_SECRET` and token exchange. |
+| 浏览器打开 `/authorize` 显示「缺少 OAuth 参数…」 | **预期**；从 ChatGPT 连接器内发起 OAuth，见上文「OAuth `/authorize` 帮助页」。 |
+| ChatGPT 显示 Unauthorized / 工具不可用 | 断开连接器 → 重新连接 → 完整 OAuth；确认 Connector URL 为 `https://ssh.zerodotsix.top/mcp`。 |
 | Tool list works but calls fail | Check SSH target env vars and audit logs under `SSH_MCP_DATA_DIR/tool-calls/`. |
 | `target_id is required` | Configure `SSH_MCP_DEFAULT_PROFILE`, mark exactly one profile as `default`, or pass `target_id` from `list-profiles`. |
 | `Unknown SSH target_id` | Refresh connector metadata if needed, call `list-profiles`, and use one of the returned profile IDs. |

@@ -82,6 +82,8 @@ https://ssh-mcp.example.com/mcp
 
 Use the detailed setup guide in [docs/CHATGPT.md](docs/CHATGPT.md).
 
+Production **ssh-mcp-chatgpt** public origin is **`https://ssh.zerodotsix.top`** on Azure Korea **`20.196.72.18`** (DNS cutover 2026-06-18). Legacy NYC **`137.184.23.118`** is standby; **not** Singapore (`139.59.96.181` / `mcp.zerodotsix.top`, remote-dev-mcp). See [docs/DEPLOYMENT-HOSTS.md](docs/DEPLOYMENT-HOSTS.md).
+
 High-level flow:
 
 1. Deploy this service behind a public HTTPS URL.
@@ -222,6 +224,11 @@ curl -sS \
 - Keep `SSH_MCP_MAX_CHARS`, `SSH_MCP_EXEC_KILL_TIME_MS`, and `SSH_MCP_EXEC_OUTPUT_MAX_CHARS` bounded for ChatGPT-facing deployments when your environment needs stricter guardrails.
 - Review redacted audit logs in `SSH_MCP_DATA_DIR/tool-calls/` when investigating tool use.
 - Use OAuth for ChatGPT connector setup. Static bearer tokens are best reserved for direct API clients and operations.
+
+## Operations
+
+- ChatGPT OAuth and Korea production: [docs/CHATGPT.md](./docs/CHATGPT.md)
+- Docker `--env-file` vs `restart` (agent runbook): [docs/DOCKER-ENV-FILE-RECREATE.md](./docs/DOCKER-ENV-FILE-RECREATE.md)
 
 ## References
 

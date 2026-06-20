@@ -1,11 +1,27 @@
 # WORKSPACE
 
+## 2026-06-20（ssh OAuth「OAuth is not configured」→ 容器 env 丢失，已修）
+
+- 现象：ChatGPT 跳转 `/authorize?...` 返回 **500 纯文本 `OAuth is not configured`**；`/health` 为 **`oauth_enabled: false`**。
+- 根因：进程未读到 **`OAUTH_LOGIN_SECRET`**（宿主机 env 曾错写 `OAUTH_OAUTH_LOGIN_SECRET`）；容器内 **`OAUTH_BASE_URL` 为空**；`SSH_MCP_DATA_DIR` 指向未挂载路径。运维常用 **`docker restart`** 不会应用 `--env-file` 变更。
+- 修复：运行 `deploy/scripts/fix-korea-oauth-data-path.py`（校正 env、从 137 同步 `OAUTH_LOGIN_SECRET`、oauth-clients 写入挂载目录、**rm+run 重建**）；复测 **`oauth_enabled: true`**，authorize 出现登录密钥表单 `name="secret"`。
+- **文档（同会话续）**：新增 `docs/DOCKER-ENV-FILE-RECREATE.md`（泛化 Agent 可复制段落 + 韩国落地表）；更新 `docs/CHATGPT.md`（500 小节、Troubleshooting、restart 说明）、`docs/DEPLOYMENT-HOSTS.md`、`README.md` Operations；增强 `fix-korea-oauth-data-path.py`。
+- 用户要求：把「避免 restart 误判」写成可交给其它 Agent 的泛化话术 → **`docs/DOCKER-ENV-FILE-RECREATE.md` 顶部「可复制段落」**。
+- 用户要求：在 **`workmust/docs/external-agents/`**（与 `Tools.md` 同路径）新建 **`docker.md`** 写入上述纪律；更新 `Tools.md` OAuth 小节（500 与 docker.md 链接）、`external-agents/README.md` 索引。
+
+## 2026-06-19（四公网 MCP「链接方式」复测 · 续）
+
+- 本会话再次执行 `probe-four-mcp-public.py`、`probe-four-mcp-oauth-link.py`：四域 `/health` **200**；韩国 ssh **`ssh_profile_count: 9`**、`default_ssh_profile_id: azure-kr-001`。
+- **未授权 `POST /mcp` + `initialize`**：tmp1/tmp2/mcp → **401**；**ssh → 200**（仅握手，**exec 等工具仍需 Bearer**）。
+- **mcp**：`oauth-protected-resource` 的 `resource` 亦为 **sandbox** 域，与 ssh/tmp 完全独立。
+- **文档**：`docs/MCP-PUBLIC-SERVICES.md` 修正未授权行为表、易混点编号与 scope 说明。
+
 ## 2026-06-19（四公网 MCP「链接方式」复测）
 
 - 公网 `/health` 四域均 **200**（与 `probe-four-mcp-public.py` 一致）：ssh 9 profiles / `azure-kr-001`；tmp1 chrome 1.2.0；tmp2 memory 0.6.4；mcp remote-dev 0.1.37。
 - **连接器 URL**：均为各自域名下的 **`https://<子域>.zerodotsix.top/mcp`**，不可互用。
 - **OAuth issuer**：ssh / tmp1 / tmp2 的 `issuer` 与公网域名一致；**mcp** 的 `/.well-known/oauth-authorization-server` 返回 **`issuer: https://sandbox.zerodotsix.top`**，`authorize`/`token` 亦在 sandbox 域（与 ssh/tmp 不同模式）。
-- **未授权 `/mcp`**：tmp1/tmp2/mcp → 401；ssh → GET 405。
+- **未授权 `/mcp`**：tmp1/tmp2/mcp → 401；ssh 裸 GET 可能 405；ssh 无 Bearer 的 `initialize` 可 200（见上节）。
 - **文档**：`docs/MCP-PUBLIC-SERVICES.md` 增补「ChatGPT 连接器链接方式」表与 mcp/sandbox 易混点。
 
 ## 2026-06-19（四公网 MCP：ssh / tmp1 / tmp2 / mcp 对照）
