@@ -751,10 +751,14 @@ function optionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value : undefined;
 }
 
-function optionalRawString(value: unknown, name: string): string | undefined {
-  if (value === undefined) return undefined;
+function requireRawString(value: unknown, name: string): string {
   if (typeof value !== "string") throw new AppError(400, name + " must be a string", "INVALID_PARAMS");
   return value;
+}
+
+function optionalRawString(value: unknown, name: string): string | undefined {
+  if (value === undefined) return undefined;
+  return requireRawString(value, name);
 }
 
 function optionalBoolean(value: unknown, name: string): boolean | undefined {
@@ -1243,7 +1247,7 @@ async function runFsEditTool(args: JsonObject, config: RuntimeConfig, target: Re
   return editRemoteFile(await remoteToolContext(target, config), {
     path: requireString(args.path, "path"),
     oldString: requireString(args.old_string, "old_string"),
-    newString: optionalRawString(args.new_string, "new_string") ?? "",
+    newString: requireRawString(args.new_string, "new_string"),
     replaceAll: optionalBoolean(args.replace_all, "replace_all"),
     elevate,
     backup: optionalBoolean(args.backup, "backup"),
