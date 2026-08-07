@@ -1062,8 +1062,13 @@ function startSshCommandJob(
       finalizeStoppedCommandJob(job);
       return;
     }
-    if (job.status === "running" && !job.stream) {
-      failCommandJob(job, "SSH connection closed before the command started");
+    if (job.status === "running") {
+      failCommandJob(
+        job,
+        job.stream
+          ? "SSH connection closed before the command finished"
+          : "SSH connection closed before the command started",
+      );
     }
   });
   conn.connect(sshConfig);
@@ -1546,6 +1551,7 @@ function commandInputSchema(config: RuntimeConfig, description: string): JsonObj
 function listTools(config: RuntimeConfig): JsonObject[] {
   const noAuth = [{ type: "noauth" }];
   const protectedSchemes = config.oauthBaseUrl ? [{ type: "oauth2", scopes: ["mcp"] }] : noAuth;
+  const defaultKillTimeMs = config.execKillTimeMs ?? DEFAULT_EXEC_KILL_TIME_MS;
 
   const tools: JsonObject[] = [
     withSecurity(
@@ -1608,7 +1614,7 @@ function listTools(config: RuntimeConfig): JsonObject[] {
               backup: { type: "boolean" },
               create_dirs: { type: "boolean" },
               normalize_newlines: { type: "boolean" },
-              verify: { type: "boolean" },
+              verify: { type: "boolean", description: "When true, re-read the remote file and compare SHA-256 after install. Default false." },
             },
             ["path"],
           ),
@@ -1673,7 +1679,11 @@ function listTools(config: RuntimeConfig): JsonObject[] {
       {
         name: "exec",
         description:
-          "Execute one simple, single-line shell command on a server-side configured SSH profile. Newlines, heredocs, loops, and conditionals are rejected: use run-script for those. Use fs-read, fs-write, or fs-edit for file operations. If the command exceeds expire_time_ms, it continues as a background job. Ask for confirmation before destructive commands.",
+          "Execute one simple, single-line shell command on a server-side configured SSH profile. Newlines, heredocs, loops, and conditionals are rejected: use run-script for those. Use fs-read, fs-write, or fs-edit for file operations. A non-zero exit code is a normal completed result, not a tool failure. Commands are killed after " +
+          defaultKillTimeMs +
+          "ms by default (kill_time_ms). If the command exceeds expire_time_ms (" +
+          config.execExpireTimeMs +
+          "ms by default), it continues as a background job. Ask for confirmation before destructive commands.",
         inputSchema: schema(
           {
             target_id: TARGET_ID_INPUT_SCHEMA,
@@ -1695,9 +1705,9 @@ function listTools(config: RuntimeConfig): JsonObject[] {
     withSecurity(
       {
         name: "exec-status",
-        description: "Fetch stdout, stderr, exit status, and progress for a background exec or sudo-exec job_id.",
+        description: "Fetch stdout, stderr, exit status, and progress for a background exec, sudo-exec, or run-script job_id.",
         inputSchema: schema(
-          { job_id: { type: "string", minLength: 1, description: "Background command job_id returned by exec or sudo-exec." } },
+          { job_id: { type: "string", minLength: 1, description: "Background command job_id returned by exec, sudo-exec, or run-script." } },
           ["job_id"],
         ),
         outputSchema: COMMAND_OUTPUT_SCHEMA,
@@ -1708,9 +1718,9 @@ function listTools(config: RuntimeConfig): JsonObject[] {
     withSecurity(
       {
         name: "exec-cancel",
-        description: "Request cancellation for a running background exec or sudo-exec job_id by sending a kill signal to the SSH channel; poll exec-status until the final cancelled/killed status is confirmed.",
+        description: "Request cancellation for a running background exec, sudo-exec, or run-script job_id by sending a kill signal to the SSH channel; poll exec-status until the final cancelled/killed status is confirmed.",
         inputSchema: schema(
-          { job_id: { type: "string", minLength: 1, description: "Background command job_id returned by exec or sudo-exec." } },
+          { job_id: { type: "string", minLength: 1, description: "Background command job_id returned by exec, sudo-exec, or run-script." } },
           ["job_id"],
         ),
         outputSchema: COMMAND_OUTPUT_SCHEMA,

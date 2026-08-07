@@ -39,6 +39,11 @@ describe('Claude Code-style remote tools', () => {
     expect(execTool.inputSchema.properties.command.maxLength).toBe(128);
     expect(execTool.description).toContain('single-line');
     expect(execTool.description).toContain('run-script');
+    expect(execTool.description).toContain('600000');
+    const execStatus = tools.find((tool) => tool.name === 'exec-status');
+    expect(execStatus?.description).toContain('run-script');
+    const fsWrite = tools.find((tool) => tool.name === 'fs-write');
+    expect(fsWrite?.inputSchema.properties.verify.description).toContain('Default false');
     expect(runScript.inputSchema.oneOf).toEqual([
       { required: ['content'] },
       { required: ['path'] },

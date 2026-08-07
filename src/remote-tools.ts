@@ -544,7 +544,7 @@ async function writeBuffer(
     );
 
     const actualHash = await remoteHash(conn, targetPath, elevate, context);
-    if (options.verify !== false && actualHash !== nextHash) {
+    if (options.verify === true && actualHash !== nextHash) {
       throw new RemoteToolError("verify", "Remote verification hash does not match uploaded content", {
         expected_sha256: nextHash,
         actual_sha256: actualHash ?? null,
