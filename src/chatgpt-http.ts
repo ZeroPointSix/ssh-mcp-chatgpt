@@ -833,14 +833,19 @@ function appendBoundedOutput(current: string, chunk: string, totalChars: number,
   if (maxChars < 64) return combined.slice(-maxChars);
 
   const markerPattern = /\n\[\.\.\. \d+ chars omitted \.\.\.\]\n/;
-  const parts = current.split(markerPattern);
-  const priorHead = parts[0] ?? "";
-  const priorTail = parts.length > 1 ? parts[parts.length - 1] ?? "" : current;
+  const marker = current.match(markerPattern);
+  const markerIndex = marker?.index;
+  const headSource =
+    marker && markerIndex !== undefined ? current.slice(0, markerIndex) : combined;
+  const tailSource =
+    marker && markerIndex !== undefined
+      ? current.slice(markerIndex + marker[0].length) + chunk
+      : combined;
   const visibleChars = maxChars - 64;
   const headLimit = Math.ceil(visibleChars / 2);
   const tailLimit = Math.floor(visibleChars / 2);
-  const head = priorHead.slice(0, headLimit);
-  const tail = (priorTail + chunk).slice(-tailLimit);
+  const head = headSource.slice(0, headLimit);
+  const tail = tailSource.slice(-tailLimit);
   const omitted = Math.max(0, totalChars - head.length - tail.length);
   return `${head}\n[... ${omitted} chars omitted ...]\n${tail}`;
 }
