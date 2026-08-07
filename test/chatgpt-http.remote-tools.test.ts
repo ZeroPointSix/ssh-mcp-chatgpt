@@ -46,7 +46,7 @@ describe('Claude Code-style remote tools', () => {
   });
 
   it.each([
-    ['newline', 'printf first\\nprintf second'],
+    ['newline', 'printf first\nprintf second'],
     ['heredoc', "cat <<'EOF'\nvalue\nEOF"],
     ['loop', 'for item in 1 2; do printf "$item"; done'],
     ['conditional', 'if true; then printf yes; fi'],
