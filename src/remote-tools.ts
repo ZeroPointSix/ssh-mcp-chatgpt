@@ -92,14 +92,12 @@ function quoteShell(value: string): string {
 }
 
 export function wrapManagedRemoteCommand(command: string, options: { usesStdin?: boolean } = {}): string {
+  void options;
   const inner =
     "trap 'kill -TERM 0 2>/dev/null; kill -KILL 0 2>/dev/null; exit 143' TERM INT; " +
     command +
     "; exit $?";
-  if (options.usesStdin) {
-    return "bash -c " + quoteShell(inner);
-  }
-  return "setsid bash -c " + quoteShell(inner);
+  return "bash -c " + quoteShell(inner);
 }
 
 export function buildSyntaxCheckCommand(interpreter: ScriptInterpreter, path: string): string {
