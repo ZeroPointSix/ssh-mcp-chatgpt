@@ -8,6 +8,20 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { Client, type ClientChannel } from "ssh2";
 import type { SSHConfig } from "./index.js";
+import {
+  FsToolError,
+  buildRunCommand,
+  fsToolDefinitions,
+  isFsToolName,
+  loadFsRuntimeConfig,
+  normalizeRemotePath,
+  parseFileMode,
+  redactFsArgs,
+  runFsPatch,
+  runFsRead,
+  runFsWrite,
+  type FsRuntimeConfig,
+} from "./fs-tools.js";
 
 type JsonRpcId = string | number | null;
 type JsonObject = Record<string, unknown>;
@@ -59,6 +73,7 @@ interface RuntimeConfig {
   execOutputMaxChars: number;
   sshProfiles: SshProfileConfig[];
   defaultSshProfileId?: string;
+  fs: FsRuntimeConfig;
 }
 
 interface SshProfileConfig {
@@ -549,6 +564,7 @@ function loadRuntimeConfig(): RuntimeConfig {
     ),
     sshProfiles: sshProfileConfig.profiles,
     defaultSshProfileId: sshProfileConfig.defaultSshProfileId,
+    fs: loadFsRuntimeConfig(process.env),
   };
 }
 
@@ -1151,6 +1167,8 @@ function redactArgs(args: JsonObject): JsonObject {
     const lower = key.toLowerCase();
     if (lower.includes("password") || lower.includes("token") || lower.includes("key")) {
       redacted[key] = "[redacted]";
+    } else if ((key === "content" || key === "old_str" || key === "new_str") && typeof value === "string") {
+      redacted[key] = `[redacted ${key}, ${value.length} chars]`;
     } else if (key === "command" && typeof value === "string") {
       redacted[key] = `[redacted command, ${value.length} chars]`;
     } else {
@@ -1226,6 +1244,10 @@ const HEALTH_OUTPUT_SCHEMA: JsonObject = {
     ssh_profiles_configured: { type: "boolean" },
     ssh_profile_count: { type: "number" },
     default_ssh_profile_id: { anyOf: [{ type: "string" }, { type: "null" }] },
+    fs_tools_enabled: { type: "boolean" },
+    fs_max_bytes: { anyOf: [{ type: "number" }, { type: "string", enum: ["none"] }] },
+    fs_allowed_roots: { type: "array", items: { type: "string" } },
+    fs_syntax_check_enabled: { type: "boolean" },
   },
   required: [
     "status",
@@ -1431,6 +1453,10 @@ function listTools(config: RuntimeConfig): JsonObject[] {
     );
   }
 
+  for (const tool of fsToolDefinitions(config.fs)) {
+    tools.push(withSecurity(tool, protectedSchemes));
+  }
+
   return tools;
 }
 
@@ -1456,7 +1482,36 @@ function healthPayload(config: RuntimeConfig): JsonObject {
     ssh_profiles_configured: config.sshProfiles.length > 0,
     ssh_profile_count: profiles.length,
     default_ssh_profile_id: config.sshProfiles.length > 0 ? config.defaultSshProfileId ?? null : (profiles[0]?.id ?? null),
+    fs_tools_enabled: config.fs.enabled,
+    fs_max_bytes: Number.isFinite(config.fs.maxBytes) ? config.fs.maxBytes : "none",
+    fs_allowed_roots: config.fs.allowedRoots,
+    fs_syntax_check_enabled: config.fs.syntaxCheckEnabled,
   };
+}
+
+function toAppErrorFromFs(error: unknown): never {
+  if (error instanceof FsToolError) throw new AppError(error.statusCode, error.message, error.code);
+  throw error;
+}
+
+async function runFsTool(name: string, args: JsonObject, config: RuntimeConfig, target: ResolvedSshTarget): Promise<JsonObject> {
+  const context = { targetId: target.id, targetLabel: target.label };
+  const sshConfig = await loadSshConfig(target);
+  try {
+    if (name === "fs-write") return await runFsWrite(sshConfig, args, config.fs, context);
+    if (name === "fs-read") return await runFsRead(sshConfig, args, config.fs, context);
+    if (name === "fs-patch") return await runFsPatch(sshConfig, args, config.fs, context);
+
+    const written = await runFsWrite(sshConfig, { ...args, mode: "overwrite", file_mode: parseFileMode(args.file_mode) ?? "755" }, config.fs, context);
+    const remoteCommand = buildRunCommand(normalizeRemotePath(args.path), args.run_command, args.interpreter);
+    const expireTimeMs = parseDurationArg(args.expire_time_ms, config.execExpireTimeMs, "expire_time_ms") ?? config.execExpireTimeMs;
+    const killTimeMs = parseDurationArg(args.kill_time_ms, config.execKillTimeMs, "kill_time_ms");
+    const job = startSshCommandJob("exec", target, sshConfig, remoteCommand, remoteCommand.length, expireTimeMs, config.execOutputMaxChars, killTimeMs);
+    await waitForCommandJob(job, expireTimeMs);
+    return { ...written, tool: "write-and-run", run: commandJobPayload(job), next_action: "Script written and started. Use exec-status with the job_id while the run is still running." };
+  } catch (error) {
+    return toAppErrorFromFs(error);
+  }
 }
 
 async function invokeTool(name: string, args: JsonObject, sessionId: string, config: RuntimeConfig): Promise<JsonObject> {
@@ -1464,6 +1519,11 @@ async function invokeTool(name: string, args: JsonObject, sessionId: string, con
     const target = resolveSshTarget(args, config);
     await auditToolCall(name, commandAuditArgs(args, target), sessionId, config);
     return runSshTool(name, args, config, target);
+  }
+  if (isFsToolName(name)) {
+    const target = resolveSshTarget(args, config);
+    await auditToolCall(name, { ...redactFsArgs(args), target_id: target.id, target_label: target.label }, sessionId, config);
+    return runFsTool(name, args, config, target);
   }
   await auditToolCall(name, args, sessionId, config);
   if (name === "health") return healthPayload(config);
