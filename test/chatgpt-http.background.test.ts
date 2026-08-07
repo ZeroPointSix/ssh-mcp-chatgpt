@@ -113,6 +113,27 @@ describe('ChatGPT HTTP background command tools', () => {
     expect(result.output_max_chars).toBe(12);
   }, 10000);
 
+  it('preserves both the head and tail when bounded output is truncated', async () => {
+    configureSshTarget();
+    process.env.SSH_MCP_EXEC_OUTPUT_MAX_CHARS = '96';
+    const config = loadRuntimeConfig();
+    const output = 'HEAD-' + 'x'.repeat(160) + '-TAIL';
+
+    const result = await invokeTool(
+      'exec',
+      { command: "printf '" + output + "'", expire_time_ms: 5000, note: 'test head and tail truncation' },
+      'test-session',
+      config,
+    );
+
+    expect(result.status).toBe('completed');
+    expect(result.stdout).toMatch(/^HEAD-/);
+    expect(result.stdout).toContain('chars omitted');
+    expect(result.stdout).toMatch(/-TAIL$/);
+    expect(result.stdout_total_chars).toBe(output.length);
+    expect(result.stdout_truncated).toBe(true);
+  }, 10000);
+
   it('reports cancellation as requested before the final terminal status is confirmed', async () => {
     configureSshTarget();
     const config = loadRuntimeConfig();
