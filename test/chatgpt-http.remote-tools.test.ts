@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { invokeTool, listTools, loadRuntimeConfig } from '../src/chatgpt-http';
+import { remoteWorkspaceRoot, wrapManagedRemoteCommand } from '../src/remote-tools';
 
 const originalEnv = { ...process.env };
 
@@ -20,6 +21,12 @@ function configureSshTarget() {
   process.env.SSH_MCP_EXEC_EXPIRE_TIME_MS = '5000';
   process.env.SSH_MCP_EXEC_KILL_TIME_MS = '10000';
   process.env.SSH_MCP_FS_ALLOWED_ROOTS = '/tmp';
+}
+
+function configureSshTargetWithSudo() {
+  configureSshTarget();
+  delete process.env.SSH_MCP_DISABLE_SUDO;
+  process.env.SSH_MCP_SUDO_PASSWORD = process.env.SSH_PASSWORD || 'secret';
 }
 
 afterEach(() => {
@@ -50,17 +57,36 @@ describe('Claude Code-style remote tools', () => {
     ]);
   });
 
+  it('scopes staging paths per ssh user and wraps managed commands', () => {
+    expect(remoteWorkspaceRoot({ sshConfig: { username: 'deploy' } } as any, 'staging')).toBe(
+      '/tmp/.mcp/users/deploy/staging',
+    );
+    expect(wrapManagedRemoteCommand('echo hi')).toContain('setsid bash -c');
+    expect(wrapManagedRemoteCommand('echo hi')).toContain('kill -TERM 0');
+  });
+
   it.each([
     ['newline', 'printf first\nprintf second'],
     ['heredoc', "cat <<'EOF'\nvalue\nEOF"],
-    ['loop', 'for item in 1 2; do printf "$item"; done'],
-    ['conditional', 'if true; then printf yes; fi'],
-  ])('rejects %s control flow from exec', async (_label, command) => {
+  ])('rejects %s from exec', async (_label, command) => {
     configureSshTarget();
     await expect(
       invokeTool('exec', { command, note: 'verify command policy' }, 'test-session', loadRuntimeConfig()),
     ).rejects.toMatchObject({ code: 'COMMAND_POLICY' });
   });
+
+  it('allows single-line control flow on exec for backward compatibility', async () => {
+    configureSshTarget();
+    const result = await invokeTool(
+      'exec',
+      { command: 'for item in 1 2; do printf "$item"; done', note: 'single-line loop' },
+      'test-session',
+      loadRuntimeConfig(),
+    );
+    expect(result.status).toBe('completed');
+    expect(result.exit_code).toBe(0);
+    expect(String(result.stdout).trim()).toBe('12');
+  }, 10000);
 
   it('round-trips write, read, edit, conflict detection, and unchanged writes', async () => {
     configureSshTarget();
@@ -234,6 +260,67 @@ describe('Claude Code-style remote tools', () => {
       config,
     );
     expect(sideEffect.exit_code).toBe(0);
+  }, 30000);
+
+  it('does not leave python syntax-check bytecode behind', async () => {
+    configureSshTarget();
+    const config = loadRuntimeConfig();
+    const scriptRoot = remoteWorkspaceRoot(
+      { sshConfig: { username: process.env.SSH_USER || 'test' } } as any,
+      'scripts',
+    );
+
+    await invokeTool(
+      'run-script',
+      {
+        content: 'print("py")\n',
+        interpreter: 'python3',
+        note: 'verify python syntax check cleanup',
+      },
+      'test-session',
+      config,
+    );
+
+    const listing = await invokeTool(
+      'exec',
+      {
+        command: "find " + scriptRoot + " -name __pycache__ 2>/dev/null | wc -l",
+        note: 'check for python bytecode cache',
+      },
+      'test-session',
+      config,
+    );
+    expect(String(listing.stdout).trim()).toBe('0');
+  }, 30000);
+
+  it('runs sudo-exec and elevated run-script against the live sshd service', async () => {
+    configureSshTargetWithSudo();
+    const config = loadRuntimeConfig();
+
+    const sudoResult = await invokeTool(
+      'sudo-exec',
+      { command: 'id -u', note: 'verify sudo-exec path' },
+      'test-session',
+      config,
+    );
+    expect(sudoResult.status).toBe('completed');
+    expect(sudoResult.exit_code).toBe(0);
+    expect(String(sudoResult.stdout).trim()).toBe('0');
+
+    const elevatedScript = await invokeTool(
+      'run-script',
+      {
+        content: 'id -u\n',
+        interpreter: 'bash',
+        elevate: true,
+        note: 'verify elevated run-script path',
+      },
+      'test-session',
+      config,
+    );
+    expect(elevatedScript.status).toBe('completed');
+    expect(elevatedScript.exit_code).toBe(0);
+    expect(String(elevatedScript.stdout).trim()).toBe('0');
   }, 30000);
 });
 

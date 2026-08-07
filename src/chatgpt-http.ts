@@ -14,6 +14,7 @@ import {
   readRemoteFile,
   RemoteToolError,
   writeRemoteFile,
+  wrapManagedRemoteCommand,
   type RemoteToolContext,
   type ScriptInterpreter,
 } from "./remote-tools.js";
@@ -37,7 +38,7 @@ const SERVER_INSTRUCTIONS = [
   "Use list-profiles before selecting a non-default target.",
   "Use fs-read for remote file inspection, fs-write for full-file replacement, and fs-edit for exact text replacement.",
   "Use run-script for multi-line commands, heredocs, loops, conditionals, or scripts. It performs a syntax check before execution by default.",
-  "Use exec only for a single-line command. Newlines, heredocs, and shell control-flow constructs are rejected.",
+  "Use exec only for a single-line command. Newlines and heredocs are rejected; prefer run-script for multi-line logic.",
   "Long-running exec, sudo-exec, and run-script calls return a job_id. Poll with exec-status or request cancellation with exec-cancel.",
   "Use note to record the reason for a tool call. Ask for confirmation before destructive operations.",
 ].join("\n");
@@ -801,12 +802,10 @@ function sanitizeCommand(command: string, maxChars: number): string {
   if (Number.isFinite(maxChars) && trimmed.length > maxChars) {
     throw new AppError(400, "Command is too long (max " + maxChars + " characters)", "INVALID_PARAMS");
   }
-  const hasControlFlow =
-    /(^|[;&|]\s*)(if|then|else|elif|fi|for|while|until|case|esac|do|done|function)\b/.test(trimmed);
-  if (/[\r\n]/.test(command) || /<<-?<?/.test(trimmed) || hasControlFlow) {
+  if (/[\r\n]/.test(command) || /<<-?<?/.test(trimmed)) {
     throw new AppError(
       400,
-      "exec and sudo-exec accept one simple line only. Use run-script for newlines, heredocs, loops, or conditionals.",
+      "exec and sudo-exec accept one simple line only. Use run-script for newlines or heredocs.",
       "COMMAND_POLICY",
     );
   }
@@ -960,16 +959,18 @@ function requestStopCommandJob(job: CommandJob, status: CommandJobStopStatus, er
 
   let signalSent = false;
   let stopError: string | undefined;
+  const stream = job.stream as (ClientChannel & { signal?: (signalName: string) => void }) | undefined;
   try {
-    (job.stream as (ClientChannel & { signal?: (signalName: string) => void }) | undefined)?.signal?.("KILL");
-    signalSent = Boolean(job.stream);
+    stream?.signal?.("TERM");
+    signalSent = Boolean(stream);
+    stream?.signal?.("KILL");
   } catch (err) {
     stopError = err instanceof Error ? err.message : "Failed to send SSH kill signal";
   }
-  try { job.stream?.close(); } catch (err) {
+  try { stream?.close(); } catch (err) {
     stopError = err instanceof Error ? err.message : "Failed to close SSH channel";
   }
-  if (!job.stream) {
+  if (!stream) {
     try { job.conn?.end(); } catch (err) {
       stopError = err instanceof Error ? err.message : "Failed to close SSH connection";
     }
@@ -1176,7 +1177,7 @@ async function runSshTool(name: "exec" | "sudo-exec", args: JsonObject, config: 
   const expireTimeMs = parseDurationArg(args.expire_time_ms, config.execExpireTimeMs, "expire_time_ms") ?? config.execExpireTimeMs;
   const killTimeMs = parseDurationArg(args.kill_time_ms, config.execKillTimeMs, "kill_time_ms");
 
-  let remoteCommand = command;
+  let remoteCommand: string;
   if (name === "sudo-exec") {
     if (config.disableSudo) {
       throw new AppError(403, "sudo-exec is disabled on this deployment", "SUDO_DISABLED");
@@ -1184,12 +1185,14 @@ async function runSshTool(name: "exec" | "sudo-exec", args: JsonObject, config: 
     if (!target.sudoEnabled) {
       throw new AppError(403, `sudo-exec is disabled for SSH target ${target.id}`, "SUDO_DISABLED");
     }
-    const quotedCommand = shellSingleQuote(command);
+    const quotedCommand = shellSingleQuote(wrapManagedRemoteCommand(command));
     if (config.sudoPassword) {
       remoteCommand = `printf '%s\\n' '${shellSingleQuote(config.sudoPassword)}' | sudo -p "" -S sh -c '${quotedCommand}'`;
     } else {
       remoteCommand = `sudo -n sh -c '${quotedCommand}'`;
     }
+  } else {
+    remoteCommand = wrapManagedRemoteCommand(command);
   }
 
   const sshConfig = await loadSshConfig(target);
@@ -1679,7 +1682,7 @@ function listTools(config: RuntimeConfig): JsonObject[] {
       {
         name: "exec",
         description:
-          "Execute one simple, single-line shell command on a server-side configured SSH profile. Newlines, heredocs, loops, and conditionals are rejected: use run-script for those. Use fs-read, fs-write, or fs-edit for file operations. A non-zero exit code is a normal completed result, not a tool failure. Commands are killed after " +
+          "Execute one simple, single-line shell command on a server-side configured SSH profile. Newlines and heredocs are rejected; prefer run-script for multi-line logic. Use fs-read, fs-write, or fs-edit for file operations. A non-zero exit code is a normal completed result, not a tool failure. Commands are killed after " +
           defaultKillTimeMs +
           "ms by default (kill_time_ms). If the command exceeds expire_time_ms (" +
           config.execExpireTimeMs +

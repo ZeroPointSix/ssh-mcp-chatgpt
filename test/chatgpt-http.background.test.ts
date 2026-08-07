@@ -170,4 +170,67 @@ describe('ChatGPT HTTP background command tools', () => {
     expect(['cancelled', 'killed']).toContain(current.status);
     expect(current.completed_at).toBeDefined();
   }, 10000);
+
+  it('stops background child processes after cancellation', async () => {
+    configureSshTarget();
+    const config = loadRuntimeConfig();
+    const marker = '/tmp/ssh-mcp-cancel-marker-' + Date.now();
+
+    const started = await invokeTool(
+      'exec',
+      {
+        command:
+          "sh -c \"rm -f '" +
+          marker +
+          "'; (while true; do date >> '" +
+          marker +
+          "'; sleep 0.2; done) & sleep 60\"",
+        expire_time_ms: 50,
+        kill_time_ms: 60000,
+        note: 'start cancellable background writer',
+      },
+      'test-session',
+      config,
+    );
+
+    expect(started.status).toBe('running');
+
+    await invokeTool(
+      'exec-cancel',
+      { job_id: started.job_id, note: 'cancel background writer' },
+      'test-session',
+      config,
+    );
+
+    let current = started;
+    for (let attempt = 0; attempt < 30 && (current.status === 'running' || current.status === 'cancelling'); attempt += 1) {
+      await sleep(150);
+      current = await invokeTool('exec-status', { job_id: started.job_id, note: 'poll cancelled writer' }, 'test-session', config);
+    }
+
+    expect(['cancelled', 'killed']).toContain(current.status);
+
+    await sleep(600);
+    const firstSize = await invokeTool(
+      'exec',
+      { command: "wc -c < '" + marker + "' 2>/dev/null || printf 0", note: 'measure marker size once' },
+      'test-session',
+      config,
+    );
+    await sleep(600);
+    const secondSize = await invokeTool(
+      'exec',
+      { command: "wc -c < '" + marker + "' 2>/dev/null || printf 0", note: 'measure marker size again' },
+      'test-session',
+      config,
+    );
+    expect(String(firstSize.stdout).trim()).toBe(String(secondSize.stdout).trim());
+
+    await invokeTool(
+      'exec',
+      { command: "rm -f -- '" + marker + "'", note: 'clean cancel marker' },
+      'test-session',
+      config,
+    );
+  }, 20000);
 });

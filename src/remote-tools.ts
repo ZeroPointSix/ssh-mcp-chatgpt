@@ -4,8 +4,12 @@ import { Client, type ClientChannel, type SFTPWrapper } from "ssh2";
 import type { SSHConfig } from "./index.js";
 
 const MAX_REMOTE_FILE_BYTES = 8 * 1024 * 1024;
-const STAGING_ROOT = "/tmp/.mcp/staging";
-const SCRIPT_ROOT = "/tmp/.mcp/scripts";
+const MCP_USER_ROOT = "/tmp/.mcp/users";
+
+export function remoteWorkspaceRoot(context: RemoteToolContext, kind: "staging" | "scripts"): string {
+  const safeUser = context.sshConfig.username.replace(/[^A-Za-z0-9_.-]/g, "_") || "unknown";
+  return `${MCP_USER_ROOT}/${safeUser}/${kind}`;
+}
 
 export class RemoteToolError extends Error {
   constructor(
@@ -85,6 +89,13 @@ interface CommandResult {
 
 function quoteShell(value: string): string {
   return "'" + value.replace(/'/g, "'\\''") + "'";
+}
+
+export function wrapManagedRemoteCommand(command: string): string {
+  const inner =
+    "trap 'kill -TERM 0 2>/dev/null; kill -KILL 0 2>/dev/null; exit 143' TERM INT HUP; " +
+    command;
+  return "setsid bash -c " + quoteShell(inner);
 }
 
 function sha256(content: Buffer): string {
@@ -499,8 +510,9 @@ async function writeBuffer(
   const mode = options.mode ?? "0644";
   assertMode(mode);
   const owner = parseOwner(options.owner ?? (elevate ? "root:root" : context.sshConfig.username));
-  await ensureStagingDirectory(conn, STAGING_ROOT, elevate, context);
-  const stagingPath = STAGING_ROOT + "/" + randomUUID();
+  const stagingRoot = remoteWorkspaceRoot(context, "staging");
+  await ensureStagingDirectory(conn, stagingRoot, elevate, context);
+  const stagingPath = stagingRoot + "/" + randomUUID();
   const targetStagingPath = pathPosix.join(
     parent,
     "." + pathPosix.basename(targetPath) + ".mcp-" + randomUUID(),
@@ -704,7 +716,14 @@ export async function editRemoteFile(
 
 function syntaxCommand(interpreter: ScriptInterpreter, path: string): string {
   if (interpreter === "python3") {
-    return "PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile " + quoteShell(path);
+    return (
+      "python3 -c " +
+      quoteShell(
+        "import ast, pathlib; ast.parse(pathlib.Path(" +
+        JSON.stringify(path) +
+        ").read_text(encoding='utf-8'))",
+      )
+    );
   }
   if (interpreter === "node") return "node --check " + quoteShell(path);
   return interpreter + " -n " + quoteShell(path);
@@ -754,9 +773,9 @@ export async function prepareRemoteScript(
       if (buffer.length > MAX_REMOTE_FILE_BYTES) {
         throw new RemoteToolError("input", "Script content exceeds 8 MiB");
       }
-      await ensureStagingDirectory(conn, SCRIPT_ROOT, elevate, context);
+      await ensureStagingDirectory(conn, remoteWorkspaceRoot(context, "scripts"), elevate, context);
       const extension = interpreter === "python3" ? ".py" : interpreter === "node" ? ".js" : ".sh";
-      scriptPath = SCRIPT_ROOT + "/" + randomUUID() + extension;
+      scriptPath = remoteWorkspaceRoot(context, "scripts") + "/" + randomUUID() + extension;
       sftp = await openSftp(conn);
       await sftpWriteFile(sftp, scriptPath, buffer);
       staged = true;
@@ -800,7 +819,7 @@ export async function prepareRemoteScript(
       }
       command = commandForElevation(command, elevate, context);
       return {
-        command,
+        command: wrapManagedRemoteCommand(command),
         commandLength: hasContent ? (options.content ?? "").length : command.length,
         stdin: options.stdin,
         timeoutMs: options.timeoutMs,
