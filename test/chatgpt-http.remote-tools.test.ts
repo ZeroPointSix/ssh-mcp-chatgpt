@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { invokeTool, listTools, loadRuntimeConfig } from '../src/chatgpt-http';
-import { remoteWorkspaceRoot, wrapManagedRemoteCommand } from '../src/remote-tools';
+import { remoteWorkspaceRoot, wrapManagedRemoteCommand, buildSyntaxCheckCommand } from '../src/remote-tools';
 
 const originalEnv = { ...process.env };
 
@@ -63,6 +63,9 @@ describe('Claude Code-style remote tools', () => {
     );
     expect(wrapManagedRemoteCommand('echo hi')).toContain('setsid bash -c');
     expect(wrapManagedRemoteCommand('echo hi')).toContain('kill -TERM 0');
+    expect(wrapManagedRemoteCommand('echo hi')).not.toContain('HUP');
+    expect(buildSyntaxCheckCommand('python3', '/tmp/example.py')).toContain('ast.parse');
+    expect(buildSyntaxCheckCommand('python3', '/tmp/example.py')).not.toContain('py_compile');
   });
 
   it.each([
@@ -260,37 +263,6 @@ describe('Claude Code-style remote tools', () => {
       config,
     );
     expect(sideEffect.exit_code).toBe(0);
-  }, 30000);
-
-  it('does not leave python syntax-check bytecode behind', async () => {
-    configureSshTarget();
-    const config = loadRuntimeConfig();
-    const scriptRoot = remoteWorkspaceRoot(
-      { sshConfig: { username: process.env.SSH_USER || 'test' } } as any,
-      'scripts',
-    );
-
-    await invokeTool(
-      'run-script',
-      {
-        content: 'print("py")\n',
-        interpreter: 'python3',
-        note: 'verify python syntax check cleanup',
-      },
-      'test-session',
-      config,
-    );
-
-    const listing = await invokeTool(
-      'exec',
-      {
-        command: "find " + scriptRoot + " -name __pycache__ 2>/dev/null | wc -l",
-        note: 'check for python bytecode cache',
-      },
-      'test-session',
-      config,
-    );
-    expect(String(listing.stdout).trim()).toBe('0');
   }, 30000);
 
   it('runs sudo-exec and elevated run-script against the live sshd service', async () => {

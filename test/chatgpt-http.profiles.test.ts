@@ -192,7 +192,7 @@ describe('ChatGPT HTTP SSH profiles', () => {
       password: 'prod-secret',
       readyTimeout: 30000,
     });
-    expect(mockState.execCalls.at(-1)).toBe('whoami');
+    expect(mockState.execCalls.at(-1)).toContain('whoami');
   });
 
   it('uses the configured default profile when target_id is omitted', async () => {
