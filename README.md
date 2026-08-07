@@ -240,3 +240,18 @@ curl -sS \
 ## License
 
 MIT. This fork preserves the original `ssh-mcp` stdio behavior while adding ChatGPT-compatible remote connector support.
+
+## File tools for long commands
+
+Set `SSH_MCP_FS_TOOLS_ENABLED=1` to add four tools: `fs-write`, `fs-read`, `fs-patch` and `write-and-run`.
+Write the file first, then run it. This keeps the command line short and safe.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `SSH_MCP_FS_TOOLS_ENABLED` | `0` | Turn the file tools on. |
+| `SSH_MCP_FS_ALLOWED_ROOTS` | none | Limit writes to these directories. Separate with `,` or `:`. |
+| `SSH_MCP_FS_MAX_BYTES` | `2000000` | Maximum bytes for one write. |
+| `SSH_MCP_FS_PREVIEW_MAX_CHARS` | `400` | Maximum characters in the write preview. |
+| `SSH_MCP_FS_READ_MAX_CHARS` | `200000` | Maximum characters for one read. |
+| `SSH_MCP_FS_SYNTAX_CHECK` | `1` | Check the syntax of a script after a write. |
+| `SSH_MCP_FS_TIMEOUT_MS` | `60000` | Timeout for one file operation. |
