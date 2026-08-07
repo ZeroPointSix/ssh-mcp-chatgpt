@@ -91,10 +91,13 @@ function quoteShell(value: string): string {
   return "'" + value.replace(/'/g, "'\\''") + "'";
 }
 
-export function wrapManagedRemoteCommand(command: string): string {
+export function wrapManagedRemoteCommand(command: string, options: { usesStdin?: boolean } = {}): string {
   const inner =
     "trap 'kill -TERM 0 2>/dev/null; kill -KILL 0 2>/dev/null; exit 143' TERM INT; " +
     command;
+  if (options.usesStdin) {
+    return "bash -c " + quoteShell(inner);
+  }
   return "setsid bash -c " + quoteShell(inner);
 }
 
@@ -823,7 +826,7 @@ export async function prepareRemoteScript(
       }
       command = commandForElevation(command, elevate, context);
       return {
-        command: wrapManagedRemoteCommand(command),
+        command,
         commandLength: hasContent ? (options.content ?? "").length : command.length,
         stdin: options.stdin,
         timeoutMs: options.timeoutMs,

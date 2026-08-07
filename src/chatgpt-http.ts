@@ -1016,6 +1016,7 @@ function startSshCommandJob(
 
   const conn = new Client();
   job.conn = conn;
+  const managedCommand = wrapManagedRemoteCommand(remoteCommand, { usesStdin: stdin !== undefined });
 
   if (killTimeMs) {
     job.killTimer = setTimeout(() => {
@@ -1026,7 +1027,7 @@ function startSshCommandJob(
 
   conn.on("ready", () => {
     job.startedAt = Date.now();
-    conn.exec(remoteCommand, (err: Error | undefined, stream: ClientChannel) => {
+    conn.exec(managedCommand, (err: Error | undefined, stream: ClientChannel) => {
       if (err) {
         failCommandJob(job, `SSH exec error: ${err.message}`);
         return;
@@ -1177,7 +1178,7 @@ async function runSshTool(name: "exec" | "sudo-exec", args: JsonObject, config: 
   const expireTimeMs = parseDurationArg(args.expire_time_ms, config.execExpireTimeMs, "expire_time_ms") ?? config.execExpireTimeMs;
   const killTimeMs = parseDurationArg(args.kill_time_ms, config.execKillTimeMs, "kill_time_ms");
 
-  let remoteCommand: string;
+  let remoteCommand = command;
   if (name === "sudo-exec") {
     if (config.disableSudo) {
       throw new AppError(403, "sudo-exec is disabled on this deployment", "SUDO_DISABLED");
@@ -1185,14 +1186,12 @@ async function runSshTool(name: "exec" | "sudo-exec", args: JsonObject, config: 
     if (!target.sudoEnabled) {
       throw new AppError(403, `sudo-exec is disabled for SSH target ${target.id}`, "SUDO_DISABLED");
     }
-    const quotedCommand = shellSingleQuote(wrapManagedRemoteCommand(command));
+    const quotedCommand = shellSingleQuote(command);
     if (config.sudoPassword) {
       remoteCommand = `printf '%s\\n' '${shellSingleQuote(config.sudoPassword)}' | sudo -p "" -S sh -c '${quotedCommand}'`;
     } else {
       remoteCommand = `sudo -n sh -c '${quotedCommand}'`;
     }
-  } else {
-    remoteCommand = wrapManagedRemoteCommand(command);
   }
 
   const sshConfig = await loadSshConfig(target);

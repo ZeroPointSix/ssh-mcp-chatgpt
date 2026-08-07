@@ -80,16 +80,36 @@ describe('ChatGPT HTTP background command tools', () => {
     const result = await invokeTool(
       'exec',
       {
-        command: 'sh -c "cat >/dev/null; exit 7"',
+        command: '/bin/false',
         expire_time_ms: 5000,
-        note: 'verify stdin closure and exit status',
+        note: 'verify non-zero exit status',
       },
       'test-session',
       config,
     );
 
     expect(result.status).toBe('completed');
-    expect(result.exit_code).toBe(7);
+    expect(result.exit_code).toBe(1);
+    expect(result.error).toBeUndefined();
+  }, 10000);
+
+  it('closes stdin without hanging commands that read it', async () => {
+    configureSshTarget();
+    const config = loadRuntimeConfig();
+
+    const result = await invokeTool(
+      'exec',
+      {
+        command: 'cat >/dev/null',
+        expire_time_ms: 5000,
+        note: 'verify stdin closure',
+      },
+      'test-session',
+      config,
+    );
+
+    expect(result.status).toBe('completed');
+    expect(result.exit_code).toBe(0);
     expect(result.error).toBeUndefined();
   }, 10000);
 

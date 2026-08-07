@@ -62,6 +62,8 @@ describe('Claude Code-style remote tools', () => {
       '/tmp/.mcp/users/deploy/staging',
     );
     expect(wrapManagedRemoteCommand('echo hi')).toContain('setsid bash -c');
+    expect(wrapManagedRemoteCommand('echo hi', { usesStdin: true })).toContain('bash -c');
+    expect(wrapManagedRemoteCommand('echo hi', { usesStdin: true })).not.toContain('setsid');
     expect(wrapManagedRemoteCommand('echo hi')).toContain('kill -TERM 0');
     expect(wrapManagedRemoteCommand('echo hi')).not.toContain('HUP');
     expect(buildSyntaxCheckCommand('python3', '/tmp/example.py')).toContain('ast.parse');
