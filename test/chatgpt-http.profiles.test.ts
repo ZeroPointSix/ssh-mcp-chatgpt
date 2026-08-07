@@ -22,6 +22,7 @@ vi.mock('ssh2', async () => {
       mockState.execCalls.push(command);
       const stream = new EventEmitter() as any;
       stream.stderr = new EventEmitter();
+      stream.end = () => undefined;
       stream.close = () => stream.emit('close', null, 'SIGTERM');
       queueMicrotask(() => {
         callback(undefined, stream);
