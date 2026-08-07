@@ -8,6 +8,15 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { Client, type ClientChannel } from "ssh2";
 import type { SSHConfig } from "./index.js";
+import {
+  editRemoteFile,
+  prepareRemoteScript,
+  readRemoteFile,
+  RemoteToolError,
+  writeRemoteFile,
+  type RemoteToolContext,
+  type ScriptInterpreter,
+} from "./remote-tools.js";
 
 type JsonRpcId = string | number | null;
 type JsonObject = Record<string, unknown>;
@@ -24,12 +33,13 @@ const DEFAULT_EXEC_OUTPUT_MAX_CHARS = 100_000;
 const COMMAND_JOB_RETENTION_MS = 24 * 60 * 60 * 1000;
 
 const SERVER_INSTRUCTIONS = [
-  "This connector executes shell commands on server-side configured SSH profiles.",
-  "Use list-profiles to see the available profile IDs and labels before selecting a non-default target.",
-  "Do not ask the user to paste SSH passwords, private keys, hostnames, or host credentials into ChatGPT; credentials and routing details are configured on the server.",
-  "Use the optional note argument on tool calls to explain why a command is being run. It is written to a redacted audit log when logging is enabled.",
-  "Long-running commands return a job_id after expire_time_ms and continue in the background. Use exec-status to poll and exec-cancel to request stopping, then poll until a final status is confirmed.",
-  "Prefer precise, non-interactive commands. Ask for confirmation before destructive operations.",
+  "This connector works with server-side configured SSH profiles. Never ask the user for SSH credentials or host details.",
+  "Use list-profiles before selecting a non-default target.",
+  "Use fs-read for remote file inspection, fs-write for full-file replacement, and fs-edit for exact text replacement.",
+  "Use run-script for multi-line commands, heredocs, loops, conditionals, or scripts. It performs a syntax check before execution by default.",
+  "Use exec only for a single-line command. Newlines, heredocs, and shell control-flow constructs are rejected.",
+  "Long-running exec, sudo-exec, and run-script calls return a job_id. Poll with exec-status or request cancellation with exec-cancel.",
+  "Use note to record the reason for a tool call. Ask for confirmation before destructive operations.",
 ].join("\n");
 
 class AppError extends Error {
@@ -58,6 +68,7 @@ interface RuntimeConfig {
   execExpireTimeMs: number;
   execKillTimeMs?: number;
   execOutputMaxChars: number;
+  fsAllowedRoots: string[];
   sshProfiles: SshProfileConfig[];
   defaultSshProfileId?: string;
 }
@@ -91,7 +102,7 @@ interface ResolvedSshTarget {
 
 const LEGACY_TARGET_ID = "default";
 
-type CommandTool = "exec" | "sudo-exec";
+type CommandTool = "exec" | "sudo-exec" | "run-script";
 type CommandJobTerminalStatus = "completed" | "failed" | "killed" | "cancelled";
 type CommandJobStopStatus = "killed" | "cancelled";
 type CommandJobStatus = "running" | "cancelling" | "kill_requested" | CommandJobTerminalStatus;
@@ -548,6 +559,7 @@ function loadRuntimeConfig(): RuntimeConfig {
     execOutputMaxChars: parseOutputMaxChars(
       getEnv("SSH_MCP_EXEC_OUTPUT_MAX_CHARS", "SSH_MCP_OUTPUT_MAX_CHARS", "EXEC_OUTPUT_MAX_CHARS"),
     ),
+    fsAllowedRoots: parseCsv(getEnv("SSH_MCP_FS_ALLOWED_ROOTS") ?? "/"),
     sshProfiles: sshProfileConfig.profiles,
     defaultSshProfileId: sshProfileConfig.defaultSshProfileId,
   };
@@ -739,13 +751,60 @@ function optionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value : undefined;
 }
 
+function optionalRawString(value: unknown, name: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") throw new AppError(400, name + " must be a string", "INVALID_PARAMS");
+  return value;
+}
+
+function optionalBoolean(value: unknown, name: string): boolean | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") throw new AppError(400, name + " must be a boolean", "INVALID_PARAMS");
+  return value;
+}
+
+function optionalInteger(value: unknown, name: string): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    throw new AppError(400, name + " must be an integer", "INVALID_PARAMS");
+  }
+  return value;
+}
+
+function optionalStringArray(value: unknown, name: string): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    throw new AppError(400, name + " must be an array of strings", "INVALID_PARAMS");
+  }
+  return value;
+}
+
+function optionalStringRecord(value: unknown, name: string): Record<string, string> | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new AppError(400, name + " must be an object with string values", "INVALID_PARAMS");
+  }
+  const entries = Object.entries(value);
+  if (entries.some(([, item]) => typeof item !== "string")) {
+    throw new AppError(400, name + " must be an object with string values", "INVALID_PARAMS");
+  }
+  return Object.fromEntries(entries) as Record<string, string>;
+}
+
 function sanitizeCommand(command: string, maxChars: number): string {
   const trimmed = command.trim();
-  if (!trimmed) {
-    throw new AppError(400, "Command cannot be empty", "INVALID_PARAMS");
-  }
+  if (!trimmed) throw new AppError(400, "Command cannot be empty", "INVALID_PARAMS");
   if (Number.isFinite(maxChars) && trimmed.length > maxChars) {
-    throw new AppError(400, `Command is too long (max ${maxChars} characters)`, "INVALID_PARAMS");
+    throw new AppError(400, "Command is too long (max " + maxChars + " characters)", "INVALID_PARAMS");
+  }
+  const hasControlFlow =
+    /(^|[;&|]\s*)(if|then|else|elif|fi|for|while|until|case|esac|do|done|function)\b/.test(trimmed);
+  if (/[\r\n]/.test(command) || /<<-?<?/.test(trimmed) || hasControlFlow) {
+    throw new AppError(
+      400,
+      "exec and sudo-exec accept one simple line only. Use run-script for newlines, heredocs, loops, or conditionals.",
+      "COMMAND_POLICY",
+    );
   }
   return trimmed;
 }
@@ -922,6 +981,7 @@ function startSshCommandJob(
   expireTimeMs: number,
   outputMaxChars: number,
   killTimeMs?: number,
+  stdin?: string,
 ): CommandJob {
   const job: CommandJob = {
     id: `job-${randomToken(12)}`,
@@ -969,7 +1029,8 @@ function startSshCommandJob(
       stream.stderr.on("data", (data: Buffer) => {
         appendCommandJobOutput(job, "stderr", data);
       });
-      stream.end();
+      if (stdin === undefined) stream.end();
+      else stream.end(stdin);
       stream.on("close", (code: number | null, signal: string | null) => {
         if (isTerminalJobStatus(job.status)) return;
         job.exitCode = code;
@@ -1132,6 +1193,97 @@ async function runSshTool(name: "exec" | "sudo-exec", args: JsonObject, config: 
   return commandJobPayload(job);
 }
 
+
+function assertRemoteElevationAllowed(elevate: boolean, target: ResolvedSshTarget, config: RuntimeConfig): void {
+  if (elevate && (config.disableSudo || !target.sudoEnabled)) {
+    throw new AppError(403, "Elevation is disabled for the selected SSH target", "SUDO_DISABLED");
+  }
+}
+
+async function remoteToolContext(target: ResolvedSshTarget, config: RuntimeConfig): Promise<RemoteToolContext> {
+  return {
+    sshConfig: await loadSshConfig(target),
+    sudoPassword: config.sudoPassword,
+    allowedRoots: config.fsAllowedRoots,
+  };
+}
+
+async function runFsReadTool(args: JsonObject, config: RuntimeConfig, target: ResolvedSshTarget): Promise<JsonObject> {
+  const elevate = optionalBoolean(args.elevate, "elevate") ?? false;
+  assertRemoteElevationAllowed(elevate, target, config);
+  return readRemoteFile(await remoteToolContext(target, config), {
+    path: requireString(args.path, "path"),
+    offset: optionalInteger(args.offset, "offset"),
+    limit: optionalInteger(args.limit, "limit"),
+    elevate,
+  });
+}
+
+async function runFsWriteTool(args: JsonObject, config: RuntimeConfig, target: ResolvedSshTarget): Promise<JsonObject> {
+  const elevate = optionalBoolean(args.elevate, "elevate") ?? false;
+  assertRemoteElevationAllowed(elevate, target, config);
+  return writeRemoteFile(await remoteToolContext(target, config), {
+    path: requireString(args.path, "path"),
+    content: optionalRawString(args.content, "content"),
+    contentBase64: optionalRawString(args.content_base64, "content_base64"),
+    expectedSha256: optionalString(args.expected_sha256),
+    mode: optionalString(args.mode),
+    owner: optionalString(args.owner),
+    elevate,
+    backup: optionalBoolean(args.backup, "backup"),
+    createDirs: optionalBoolean(args.create_dirs, "create_dirs"),
+    normalizeNewlines: optionalBoolean(args.normalize_newlines, "normalize_newlines"),
+    verify: optionalBoolean(args.verify, "verify"),
+  });
+}
+
+async function runFsEditTool(args: JsonObject, config: RuntimeConfig, target: ResolvedSshTarget): Promise<JsonObject> {
+  const elevate = optionalBoolean(args.elevate, "elevate") ?? false;
+  assertRemoteElevationAllowed(elevate, target, config);
+  return editRemoteFile(await remoteToolContext(target, config), {
+    path: requireString(args.path, "path"),
+    oldString: requireString(args.old_string, "old_string"),
+    newString: optionalRawString(args.new_string, "new_string") ?? "",
+    replaceAll: optionalBoolean(args.replace_all, "replace_all"),
+    elevate,
+    backup: optionalBoolean(args.backup, "backup"),
+  });
+}
+
+async function runScriptTool(args: JsonObject, config: RuntimeConfig, target: ResolvedSshTarget): Promise<JsonObject> {
+  const elevate = optionalBoolean(args.elevate, "elevate") ?? false;
+  assertRemoteElevationAllowed(elevate, target, config);
+  const timeoutMs = parseDurationArg(args.timeout_ms, config.execKillTimeMs, "timeout_ms");
+  const prepared = await prepareRemoteScript(await remoteToolContext(target, config), {
+    content: optionalRawString(args.content, "content"),
+    path: optionalRawString(args.path, "path"),
+    interpreter: optionalString(args.interpreter) as ScriptInterpreter | undefined,
+    args: optionalStringArray(args.args, "args"),
+    cwd: optionalString(args.cwd),
+    env: optionalStringRecord(args.env, "env"),
+    checkSyntax: optionalBoolean(args.check_syntax, "check_syntax"),
+    elevate,
+    timeoutMs,
+    stdin: optionalRawString(args.stdin, "stdin"),
+  });
+  const expireTimeMs =
+    parseDurationArg(args.expire_time_ms, config.execExpireTimeMs, "expire_time_ms") ??
+    config.execExpireTimeMs;
+  const job = startSshCommandJob(
+    "run-script",
+    target,
+    await loadSshConfig(target),
+    prepared.command,
+    prepared.commandLength,
+    expireTimeMs,
+    config.execOutputMaxChars,
+    prepared.timeoutMs,
+    prepared.stdin,
+  );
+  await waitForCommandJob(job, expireTimeMs);
+  return commandJobPayload(job);
+}
+
 function getCommandJob(args: JsonObject): CommandJob {
   const jobId = requireString(args.job_id, "job_id");
   const job = commandJobs.get(jobId);
@@ -1160,8 +1312,11 @@ function redactArgs(args: JsonObject): JsonObject {
     const lower = key.toLowerCase();
     if (lower.includes("password") || lower.includes("token") || lower.includes("key")) {
       redacted[key] = "[redacted]";
-    } else if (key === "command" && typeof value === "string") {
-      redacted[key] = `[redacted command, ${value.length} chars]`;
+    } else if (
+      ["command", "content", "content_base64", "old_string", "new_string", "stdin", "env"].includes(key)
+    ) {
+      const size = typeof value === "string" ? value.length : JSON.stringify(value).length;
+      redacted[key] = "[redacted " + key + ", " + size + " chars]";
     } else {
       redacted[key] = value;
     }
@@ -1282,11 +1437,48 @@ const LIST_PROFILES_OUTPUT_SCHEMA: JsonObject = {
   additionalProperties: false,
 };
 
+
+const FS_READ_OUTPUT_SCHEMA: JsonObject = {
+  type: "object",
+  properties: {
+    path: { type: "string" },
+    content: { type: "string" },
+    total_lines: { type: "number" },
+    truncated: { type: "boolean" },
+    sha256: { type: "string" },
+  },
+  required: ["path", "content", "total_lines", "truncated", "sha256"],
+  additionalProperties: false,
+};
+
+const FILE_MUTATION_PROPERTIES: JsonObject = {
+  path: { type: "string" },
+  bytes_written: { type: "number" },
+  sha256: { type: "string" },
+  backup_path: { type: "string" },
+  created_dirs: { type: "array", items: { type: "string" } },
+  unchanged: { type: "boolean" },
+};
+
+const FS_WRITE_OUTPUT_SCHEMA: JsonObject = {
+  type: "object",
+  properties: FILE_MUTATION_PROPERTIES,
+  required: ["path", "bytes_written", "sha256"],
+  additionalProperties: false,
+};
+
+const FS_EDIT_OUTPUT_SCHEMA: JsonObject = {
+  type: "object",
+  properties: { ...FILE_MUTATION_PROPERTIES, replacements: { type: "number" } },
+  required: ["path", "bytes_written", "sha256", "replacements"],
+  additionalProperties: false,
+};
+
 const COMMAND_OUTPUT_SCHEMA: JsonObject = {
   type: "object",
   properties: {
     status: { type: "string", enum: ["running", "cancelling", "kill_requested", "completed", "failed", "killed", "cancelled"] },
-    tool: { type: "string", enum: ["exec", "sudo-exec"] },
+    tool: { type: "string", enum: ["exec", "sudo-exec", "run-script"] },
     target_id: { type: "string" },
     target_label: { type: "string" },
     job_id: { type: "string" },
@@ -1336,6 +1528,12 @@ const TARGET_ID_INPUT_SCHEMA: JsonObject = {
     "Optional server-side SSH profile ID. Required when no default profile is configured. Do not pass hostnames or credential material here.",
 };
 
+function commandInputSchema(config: RuntimeConfig, description: string): JsonObject {
+  const value: JsonObject = { type: "string", minLength: 1, description };
+  if (Number.isFinite(config.maxChars)) value.maxLength = config.maxChars;
+  return value;
+}
+
 function listTools(config: RuntimeConfig): JsonObject[] {
   const noAuth = [{ type: "noauth" }];
   const protectedSchemes = config.oauthBaseUrl ? [{ type: "oauth2", scopes: ["mcp"] }] : noAuth;
@@ -1364,14 +1562,114 @@ function listTools(config: RuntimeConfig): JsonObject[] {
     ),
     withSecurity(
       {
-        name: "exec",
+        name: "fs-read",
         description:
-          "Execute a shell command on a server-side configured SSH profile. Use list-profiles to see available profile IDs and labels. Pass target_id to select a profile, or omit it only when the deployment has a default profile. If no default profile is configured, target_id is required. Do not pass hostnames, passwords, private keys, or credential material in tool arguments. If the command exceeds expire_time_ms, the tool returns a running job_id while the command continues in the background. Use exec-status to poll it. Ask for confirmation before running destructive commands.",
+          "Read a remote text file through SFTP and return stable six-character line numbers, a SHA-256 hash, and truncation metadata. Use offset and limit for large files. Use this instead of cat, sed, head, tail, or awk when inspecting a file.",
         inputSchema: schema(
           {
             target_id: TARGET_ID_INPUT_SCHEMA,
-            command: { type: "string", minLength: 1, description: "Shell command to execute on the selected SSH profile." },
-            description: { type: "string", description: "Optional legacy command comment appended on the remote shell." },
+            path: { type: "string", minLength: 1, description: "Absolute remote path under the configured allowed roots." },
+            offset: { type: "integer", minimum: 1 },
+            limit: { type: "integer", minimum: 1, maximum: 20000 },
+            elevate: { type: "boolean" },
+          },
+          ["path"],
+        ),
+        outputSchema: FS_READ_OUTPUT_SCHEMA,
+        annotations: { readOnlyHint: true },
+      },
+      protectedSchemes,
+    ),
+    withSecurity(
+      {
+        name: "fs-write",
+        description:
+          "Safely replace a remote file through a staged upload and atomic install. Supports text or canonical base64, optimistic SHA-256 checks, backup, parent creation, mode/owner changes, newline normalization, and verification. Use this instead of shell redirection, tee, base64 pipelines, or heredocs.",
+        inputSchema: {
+          ...schema(
+            {
+              target_id: TARGET_ID_INPUT_SCHEMA,
+              path: { type: "string", minLength: 1 },
+              content: { type: "string", description: "UTF-8 content; mutually exclusive with content_base64." },
+              content_base64: { type: "string", description: "Canonical base64 bytes; mutually exclusive with content." },
+              expected_sha256: { type: "string", pattern: "^[a-fA-F0-9]{64}$" },
+              mode: { type: "string", pattern: "^0?[0-7]{3,4}$" },
+              owner: { type: "string" },
+              elevate: { type: "boolean" },
+              backup: { type: "boolean" },
+              create_dirs: { type: "boolean" },
+              normalize_newlines: { type: "boolean" },
+              verify: { type: "boolean" },
+            },
+            ["path"],
+          ),
+          oneOf: [{ required: ["content"] }, { required: ["content_base64"] }],
+        },
+        outputSchema: FS_WRITE_OUTPUT_SCHEMA,
+      },
+      protectedSchemes,
+    ),
+    withSecurity(
+      {
+        name: "fs-edit",
+        description:
+          "Replace an exact UTF-8 string in a remote file with optimistic hash protection and an optional backup. A single match is required unless replace_all is true. Errors include line numbers or nearby candidates. Use this instead of sed, perl, or awk.",
+        inputSchema: schema(
+          {
+            target_id: TARGET_ID_INPUT_SCHEMA,
+            path: { type: "string", minLength: 1 },
+            old_string: { type: "string", minLength: 1 },
+            new_string: { type: "string" },
+            replace_all: { type: "boolean" },
+            elevate: { type: "boolean" },
+            backup: { type: "boolean" },
+          },
+          ["path", "old_string", "new_string"],
+        ),
+        outputSchema: FS_EDIT_OUTPUT_SCHEMA,
+      },
+      protectedSchemes,
+    ),
+    withSecurity(
+      {
+        name: "run-script",
+        description:
+          "Run a remote bash, sh, Python, or Node script. Use this for multi-line logic, heredocs, loops, conditionals, or commands too complex for exec. Provide inline content or an existing absolute path. Inline scripts are staged outside the command line, syntax-checked by default, and removed after execution.",
+        inputSchema: {
+          ...schema({
+            target_id: TARGET_ID_INPUT_SCHEMA,
+            content: { type: "string", description: "Inline script; mutually exclusive with path." },
+            path: { type: "string", minLength: 1, description: "Existing absolute script path; mutually exclusive with content." },
+            interpreter: { type: "string", enum: ["bash", "sh", "python3", "node"] },
+            args: { type: "array", items: { type: "string" } },
+            cwd: { type: "string", minLength: 1 },
+            env: { type: "object", additionalProperties: { type: "string" } },
+            check_syntax: { type: "boolean" },
+            elevate: { type: "boolean" },
+            timeout_ms: { anyOf: [{ type: "number" }, { type: "string", enum: ["none"] }] },
+            expire_time_ms: { type: "number" },
+            stdin: { type: "string" },
+          }),
+          oneOf: [{ required: ["content"] }, { required: ["path"] }],
+        },
+        outputSchema: COMMAND_OUTPUT_SCHEMA,
+        _meta: {
+          "openai/toolInvocation/invoking": "Running remote script",
+          "openai/toolInvocation/invoked": "Remote script finished",
+        },
+      },
+      protectedSchemes,
+    ),
+    withSecurity(
+      {
+        name: "exec",
+        description:
+          "Execute one simple, single-line shell command on a server-side configured SSH profile. Newlines, heredocs, loops, and conditionals are rejected: use run-script for those. Use fs-read, fs-write, or fs-edit for file operations. If the command exceeds expire_time_ms, it continues as a background job. Ask for confirmation before destructive commands.",
+        inputSchema: schema(
+          {
+            target_id: TARGET_ID_INPUT_SCHEMA,
+            command: commandInputSchema(config, "One simple shell command on a single line. Use run-script for multi-line or control-flow logic and fs-* for file operations."),
+            description: { type: "string", description: "Optional legacy audit description. It is never added to the remote command." },
             expire_time_ms: { type: "number", description: "Optional time to wait before returning a running job_id. Defaults to deployment configuration." },
             kill_time_ms: { anyOf: [{ type: "number" }, { type: "string", enum: ["none"] }], description: "Optional hard deadline for killing the background command. Defaults to deployment configuration; none disables the hard deadline." },
           },
@@ -1422,8 +1720,8 @@ function listTools(config: RuntimeConfig): JsonObject[] {
           inputSchema: schema(
             {
               target_id: TARGET_ID_INPUT_SCHEMA,
-              command: { type: "string", minLength: 1, description: "Shell command to execute with sudo on the selected SSH profile." },
-              description: { type: "string", description: "Optional legacy command comment appended on the remote shell." },
+              command: commandInputSchema(config, "One simple shell command to execute with sudo. Use run-script with elevate for multi-line or control-flow logic."),
+              description: { type: "string", description: "Optional legacy audit description. It is never added to the remote command." },
               expire_time_ms: { type: "number", description: "Optional time to wait before returning a running job_id. Defaults to deployment configuration." },
               kill_time_ms: { anyOf: [{ type: "number" }, { type: "string", enum: ["none"] }], description: "Optional hard deadline for killing the background command. Defaults to deployment configuration; none disables the hard deadline." },
             },
@@ -1469,17 +1767,22 @@ function healthPayload(config: RuntimeConfig): JsonObject {
 }
 
 async function invokeTool(name: string, args: JsonObject, sessionId: string, config: RuntimeConfig): Promise<JsonObject> {
-  if (name === "exec" || name === "sudo-exec") {
+  const targetTools = new Set(["exec", "sudo-exec", "fs-read", "fs-write", "fs-edit", "run-script"]);
+  if (targetTools.has(name)) {
     const target = resolveSshTarget(args, config);
     await auditToolCall(name, commandAuditArgs(args, target), sessionId, config);
-    return runSshTool(name, args, config, target);
+    if (name === "exec" || name === "sudo-exec") return runSshTool(name, args, config, target);
+    if (name === "fs-read") return runFsReadTool(args, config, target);
+    if (name === "fs-write") return runFsWriteTool(args, config, target);
+    if (name === "fs-edit") return runFsEditTool(args, config, target);
+    return runScriptTool(args, config, target);
   }
   await auditToolCall(name, args, sessionId, config);
   if (name === "health") return healthPayload(config);
   if (name === "list-profiles") return listProfilesTool(config);
   if (name === "exec-status") return runCommandStatusTool(args);
   if (name === "exec-cancel") return runCommandCancelTool(args);
-  throw new AppError(404, `Unknown tool: ${name}`, "UNKNOWN_TOOL");
+  throw new AppError(404, "Unknown tool: " + name, "UNKNOWN_TOOL");
 }
 
 function getOrCreateSessionId(req: IncomingMessage): string {
@@ -1598,13 +1901,19 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse, config: Runt
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : "Tool call failed";
-      const code = error instanceof AppError ? error.code : "TOOL_FAILED";
+      const code =
+        error instanceof RemoteToolError
+          ? "REMOTE_" + error.stage.replace(/[^A-Za-z0-9]+/g, "_").toUpperCase()
+          : error instanceof AppError
+            ? error.code
+            : "TOOL_FAILED";
+      const details = error instanceof RemoteToolError ? { stage: error.stage, ...error.details } : {};
       sendJson(
         res,
         200,
         jsonRpcSuccess(id, {
           content: [{ type: "text", text: message }],
-          structuredContent: { status: "failed", error: message, code },
+          structuredContent: { status: "failed", error: message, code, ...details },
           isError: true,
         }),
         headers,
