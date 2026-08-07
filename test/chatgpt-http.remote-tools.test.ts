@@ -95,7 +95,6 @@ describe('Claude Code-style remote tools', () => {
         path,
         old_string: 'beta',
         new_string: 'gamma',
-        backup: false,
         note: 'edit test file',
       },
       'test-session',
@@ -103,6 +102,15 @@ describe('Claude Code-style remote tools', () => {
     );
     expect(edited.replacements).toBe(1);
     expect(edited.sha256).not.toBe(firstRead.sha256);
+    expect(edited.backup_path).toMatch(/^\/tmp\/ssh-mcp-tools-.+\.bak\.\d{14}$/);
+
+    const backupRead = await invokeTool(
+      'fs-read',
+      { path: edited.backup_path, note: 'verify backup content' },
+      'test-session',
+      config,
+    );
+    expect(backupRead.content).toBe('     1\talpha\n     2\tbeta');
 
     await expect(
       invokeTool(
