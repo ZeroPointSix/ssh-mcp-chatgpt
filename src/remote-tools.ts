@@ -501,6 +501,10 @@ async function writeBuffer(
   const owner = parseOwner(options.owner ?? (elevate ? "root:root" : context.sshConfig.username));
   await ensureStagingDirectory(conn, STAGING_ROOT, elevate, context);
   const stagingPath = STAGING_ROOT + "/" + randomUUID();
+  const targetStagingPath = pathPosix.join(
+    parent,
+    "." + pathPosix.basename(targetPath) + ".mcp-" + randomUUID(),
+  );
   const sftp = await openSftp(conn);
   await sftpWriteFile(sftp, stagingPath, buffer);
 
@@ -526,15 +530,21 @@ async function writeBuffer(
       " -o " +
       quoteShell(owner.user);
     if (owner.group) install += " -g " + quoteShell(owner.group);
-    install += " -- " + quoteShell(stagingPath) + " " + quoteShell(targetPath);
+    install += " -- " + quoteShell(stagingPath) + " " + quoteShell(targetStagingPath);
+    const publish =
+      install +
+      " && mv -f -- " +
+      quoteShell(targetStagingPath) +
+      " " +
+      quoteShell(targetPath);
     await checkedCommand(
       conn,
-      commandForElevation(install, elevate, context),
+      commandForElevation(publish, elevate, context),
       "install",
     );
 
     const actualHash = await remoteHash(conn, targetPath, elevate, context);
-    if (options.verify && actualHash !== nextHash) {
+    if (options.verify !== false && actualHash !== nextHash) {
       throw new RemoteToolError("verify", "Remote verification hash does not match uploaded content", {
         expected_sha256: nextHash,
         actual_sha256: actualHash ?? null,
@@ -550,6 +560,10 @@ async function writeBuffer(
     };
   } finally {
     await sftpUnlink(sftp, stagingPath);
+    await execCommand(
+      conn,
+      commandForElevation("rm -f -- " + quoteShell(targetStagingPath), elevate, context),
+    ).catch(() => undefined);
   }
 }
 
