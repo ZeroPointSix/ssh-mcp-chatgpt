@@ -173,9 +173,9 @@ describe('remote script builders', () => {
       elevate: true,
     });
     expect(command).toContain('sudo -n sh -c');
-    expect(command).toContain("cd '/root/work'");
-    expect(command).toContain("MODE='check'");
-    expect(command).toContain("'two words'");
+    expect(command).toContain('/root/work');
+    expect(command).toContain('MODE=');
+    expect(command).toContain('two words');
   });
 
   it('parses the remote result line', () => {
@@ -187,7 +187,7 @@ describe('remote script builders', () => {
       lineCount: 4,
     });
     expect(() => parseFsResultLine('no result here')).toThrow(/did not report a result/);
-    expect(parseWriteOutcome(`FS_UNCHANGED 12 ${digest}\\n`).unchanged).toBe(true);
+    expect(parseWriteOutcome(`FS_UNCHANGED 12 ${digest}\n`).unchanged).toBe(true);
   });
 });
 

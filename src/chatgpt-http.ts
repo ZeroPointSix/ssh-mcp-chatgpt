@@ -981,8 +981,10 @@ function startSshCommandJob(
         }
         finishCommandJob(job, { status: "completed" });
       });
-      if (stdin !== undefined) stream.end(stdin);
-      else stream.end();
+      if (typeof stream.end === "function") {
+        if (stdin !== undefined) stream.end(stdin);
+        else stream.end();
+      }
     });
   });
 
