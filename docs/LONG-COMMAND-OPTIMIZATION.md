@@ -24,29 +24,35 @@ short command. The file body must not go through the shell command line.
 
 | Tool | Function |
 | ---- | -------- |
-| `fs-write` | Send text to a remote path through the SSH channel stdin as base64. Modes: `create`, `overwrite`, `append`. Writes to a temporary file and then moves it into place. Returns bytes, sha256, and a short preview. |
-| `fs-read` | Read a bounded window of a remote file. Returns bytes, sha256, the selected lines, and truncation metadata. |
-| `fs-patch` | Replace one exact and unique string in a remote file. Keeps a backup copy. Returns sha256 before and after. |
-| `write-and-run` | Do `fs-write` and then run the file with the same background job behavior as `exec`. |
+| `fs-read` | Resolve the canonical path and read a bounded line window. Return numbered lines, total lines, truncation state, and sha256. |
+| `fs-write` | Send text or binary data through SFTP staging. Check the old sha256 before backup or replacement. Support `sudo -n install` for elevated writes. |
+| `fs-edit` | Replace exact text. Read the source, stage the result, and recheck the source sha256 immediately before replacement. |
+| `run-script` | Run content or an existing path with an explicit interpreter and a syntax check before execution. |
 
-## Long content
+## Write sequence
 
-Large files use more than one `fs-write` call:
-
-1. First call uses `mode: "overwrite"`.
-2. Each next call uses `mode: "append"`.
-3. The last call sends `expected_sha256` of the full file. The server compares
-   the value and fails if the file is different.
+1. Resolve the target with remote `realpath`.
+2. Resolve each allowed root and compare canonical paths.
+3. Upload the complete body to `/tmp/.mcp/staging/<uuid>` through SFTP.
+4. Check the staging sha256.
+5. Check `expected_sha256` against the target before any backup or write.
+6. Skip the write when the target already has the same sha256.
+7. Back up the target by default.
+8. Install to a temporary file in the target directory and rename it.
+9. Return bytes and sha256. When `verify` is true, reject a read-back mismatch.
 
 ## Safety rules
 
 - The remote path must be absolute. The server rejects `..`, NUL characters,
   and newline characters in the path.
-- `SSH_MCP_FS_ALLOWED_ROOTS` gives the permitted directories. A path outside
-  these roots is rejected.
-- The file body is never put into the shell command line. Only the quoted path
-  goes into the command.
+- File tools are disabled by default.
+- `SSH_MCP_FS_ALLOWED_ROOTS` gives the permitted canonical directories. An
+  empty allowlist denies every user-supplied path.
+- The file body is never put into the shell command line. SFTP carries the body.
 - `SSH_MCP_FS_MAX_BYTES` limits one write.
+- `fs-read` limits both lines and characters on the remote host before stdout
+  reaches Node.
+- `fs-edit` uses the hash from its read as a mandatory write-time precondition.
 - The audit log records the path, the byte count, and the sha256 value. It does
   not record the content.
 
@@ -56,13 +62,13 @@ When the deployment enables the check, the server validates the new file before
 it replaces the old file:
 
 - `.sh`, `.bash`: `bash -n`
-- `.py`: `python3 -m py_compile`
+- `.py`: parse with Python `ast`
 - `.json`: parsed on the server
 
 If the check fails, the temporary file is removed and the original file stays.
 
-## Phases
+## Command selection
 
-1. Phase 1: `fs-write`, `fs-read`, `write-and-run`, path guards, audit fields.
-2. Phase 2: `fs-patch` and the syntax check.
-3. Phase 3: a persistent shell session and a code execution mode.
+`exec` accepts only one-line commands. Use `fs-write` for file content,
+`fs-edit` for exact changes, `fs-read` for file reads, and `run-script` for
+newlines, heredocs, loops, conditionals, or functions.

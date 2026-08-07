@@ -243,15 +243,23 @@ MIT. This fork preserves the original `ssh-mcp` stdio behavior while adding Chat
 
 ## File tools for long commands
 
-Set `SSH_MCP_FS_TOOLS_ENABLED=1` to add four tools: `fs-write`, `fs-read`, `fs-patch` and `write-and-run`.
-Write the file first, then run it. This keeps the command line short and safe.
+Set `SSH_MCP_FS_TOOLS_ENABLED=1` to add four tools: `fs-read`, `fs-write`, `fs-edit`, and `run-script`.
+You must also set `SSH_MCP_FS_ALLOWED_ROOTS`. An empty allowlist denies every user-supplied path.
+
+- `fs-read` resolves the remote real path, checks the allowlist, and limits lines and characters before stdout reaches Node.
+- `fs-write` sends bytes through SFTP staging. It checks `expected_sha256` before backup or replacement and uses a same-directory atomic rename.
+- `fs-edit` replaces exact text and rechecks the source hash immediately before replacement.
+- `run-script` accepts script content or an existing path, checks syntax, and uses an explicit interpreter.
+
+Use `elevate: true` for root-owned files. Elevated writes use SFTP staging plus `sudo -n install`. Parent directories are not created unless `create_dirs: true` is explicit.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `SSH_MCP_FS_TOOLS_ENABLED` | `0` | Turn the file tools on. |
-| `SSH_MCP_FS_ALLOWED_ROOTS` | none | Limit writes to these directories. Separate with `,` or `:`. |
-| `SSH_MCP_FS_MAX_BYTES` | `2000000` | Maximum bytes for one write. |
+| `SSH_MCP_FS_ALLOWED_ROOTS` | none | Permit only these canonical remote directories. An empty value denies all paths. Separate entries with `,` or `:`. |
+| `SSH_MCP_FS_MAX_BYTES` | `8000000` | Maximum bytes for one write or edit. |
 | `SSH_MCP_FS_PREVIEW_MAX_CHARS` | `400` | Maximum characters in the write preview. |
 | `SSH_MCP_FS_READ_MAX_CHARS` | `200000` | Maximum characters for one read. |
+| `SSH_MCP_FS_READ_MAX_LINES` | `2000` | Maximum lines for one read. |
 | `SSH_MCP_FS_SYNTAX_CHECK` | `1` | Check the syntax of a script after a write. |
 | `SSH_MCP_FS_TIMEOUT_MS` | `60000` | Timeout for one file operation. |

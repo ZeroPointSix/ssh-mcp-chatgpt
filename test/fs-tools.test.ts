@@ -1,24 +1,28 @@
 import { describe, it, expect } from 'vitest';
 import {
   DEFAULT_FS_MAX_BYTES,
+  DEFAULT_FS_READ_MAX_LINES,
   FS_CONTENT_SENTINEL,
   FsToolError,
   assertPathAllowed,
   buildPreview,
+  buildRawReadScript,
   buildReadScript,
+  buildResolvePathScript,
   buildRunCommand,
   buildWriteScript,
   decodeContent,
+  decodeFileContent,
   fsToolDefinitions,
   isFsToolName,
   loadFsRuntimeConfig,
   normalizeRemotePath,
   parseAllowedRoots,
-  parseEncoding,
   parseFileMode,
   parseFsResultLine,
+  parseOwner,
   parseSha256,
-  parseWriteMode,
+  parseWriteOutcome,
   redactFsArgs,
   sha256Hex,
   shellQuote,
@@ -52,9 +56,16 @@ describe('remote path guards', () => {
     expect(() => assertPathAllowed('/root/workspace/app.sh', roots)).toThrow(/allowed roots/);
   });
 
-  it('allows every absolute path when no root is configured', () => {
+  it('rejects every path when no root is configured', () => {
     expect(parseAllowedRoots(undefined)).toEqual([]);
-    expect(() => assertPathAllowed('/etc/hosts', [])).not.toThrow();
+    expect(() => assertPathAllowed('/etc/hosts', [])).toThrow(/No allowed roots/);
+  });
+
+  it('resolves real paths before applying the remote allowlist', () => {
+    const script = buildResolvePathScript('/srv/app/config', ['/srv/app'], false);
+    expect(script.indexOf('canonical=$(realpath')).toBeLessThan(script.indexOf('case "$canonical"'));
+    expect(script).toContain('root_real=$(realpath -m "$root")');
+    expect(script).toContain('exit 77');
   });
 });
 
@@ -69,6 +80,9 @@ describe('payload handling', () => {
     expect(decodeContent('aGVsbG8=', 'base64').toString('utf8')).toBe('hello');
     expect(() => decodeContent('not base64!', 'base64')).toThrow(/valid base64/);
     expect(() => decodeContent(42, 'utf8')).toThrow(/must be a string/);
+    expect(decodeFileContent({ content: 'a\r\nb' }).payload.toString()).toBe('a\nb');
+    expect(decodeFileContent({ content_base64: 'aGVsbG8=' }).payload.toString()).toBe('hello');
+    expect(() => decodeFileContent({ content: 'a', content_base64: 'YQ==' })).toThrow(/exactly one/);
   });
 
   it('builds a bounded preview', () => {
@@ -81,14 +95,6 @@ describe('payload handling', () => {
   });
 
   it('validates the option values', () => {
-    expect(parseWriteMode(undefined)).toBe('overwrite');
-    expect(parseWriteMode('append')).toBe('append');
-    expect(() => parseWriteMode('delete')).toThrow(/create, overwrite, or append/);
-
-    expect(parseEncoding(undefined)).toBe('utf8');
-    expect(parseEncoding('base64')).toBe('base64');
-    expect(() => parseEncoding('hex')).toThrow(/utf8 or base64/);
-
     expect(parseFileMode('0755')).toBe('0755');
     expect(parseFileMode(undefined)).toBeUndefined();
     expect(() => parseFileMode('999')).toThrow(/octal/);
@@ -96,6 +102,9 @@ describe('payload handling', () => {
     expect(parseSha256(undefined, 'expected_sha256')).toBeUndefined();
     expect(parseSha256('A'.repeat(64), 'expected_sha256')).toBe('a'.repeat(64));
     expect(() => parseSha256('abc', 'expected_sha256')).toThrow(/64 character hex/);
+
+    expect(parseOwner('root:root')).toEqual({ user: 'root', group: 'root' });
+    expect(() => parseOwner('root')).toThrow(/user:group/);
   });
 
   it('computes stable sha256 values', () => {
@@ -105,70 +114,68 @@ describe('payload handling', () => {
 });
 
 describe('remote script builders', () => {
-  it('sends the content through stdin and never through the command line', () => {
-    const script = buildWriteScript({ path: '/root/work/app.sh', mode: 'overwrite', createDirs: true, fileMode: '755' });
+  const writeOptions = {
+    path: '/root/work/app.sh',
+    stagingPath: '/tmp/.mcp/staging/id',
+    createDirs: false,
+    fileMode: '0755',
+    payloadSha: 'a'.repeat(64),
+    verify: true,
+    elevate: false,
+  };
 
-    expect(script).toContain("target='/root/work/app.sh'");
-    expect(script).toContain('base64 -d > "$tmp"');
-    expect(script).toContain('mkdir -p "$(dirname "$target")"');
-    expect(script).toContain('chmod 755 "$tmp"');
-    expect(script).toContain('mv -f "$tmp" "$target"');
-    expect(script).toContain("printf 'FS_RESULT %s %s\\n'");
-    expect(script).toContain('trap');
+  it('installs an SFTP staging file through a same-directory temporary file', () => {
+    const script = buildWriteScript(writeOptions);
+    expect(script).toContain("staging='/tmp/.mcp/staging/id'");
+    expect(script).toContain('install -m 0755 "$staging" "$install_tmp"');
+    expect(script).toContain('mv -f "$install_tmp" "$target"');
+    expect(script).not.toContain('base64 -d');
   });
 
-  it('guards create mode and appends without a rename', () => {
-    const create = buildWriteScript({ path: '/root/work/new.txt', mode: 'create', createDirs: false });
-    expect(create).toContain('if [ -e "$target" ]; then');
-    expect(create).not.toContain('mkdir -p');
-
-    const append = buildWriteScript({ path: '/root/work/new.txt', mode: 'append', createDirs: false });
-    expect(append).toContain('cat "$tmp" >> "$target"');
-    expect(append).not.toContain('mv -f "$tmp" "$target"');
-  });
-
-  it('keeps a backup copy when a suffix is given', () => {
+  it('checks expected_sha256 before backup or replacement', () => {
     const script = buildWriteScript({
-      path: '/root/work/app.sh',
-      mode: 'overwrite',
-      createDirs: false,
+      ...writeOptions,
+      expectedSha: 'b'.repeat(64),
       backupSuffix: '.bak.1700000000000',
     });
-    expect(script).toContain('cp -p "$target" "$target.bak.1700000000000"');
+    const conflict = script.indexOf('FS_CONFLICT');
+    expect(conflict).toBeLessThan(script.indexOf('cp -a "$target"'));
+    expect(conflict).toBeLessThan(script.indexOf('install -m'));
   });
 
-  it('checks the syntax of scripts and json before the file is moved into place', () => {
-    expect(syntaxCheckStatement('/root/work/app.sh')).toContain('bash -n "$tmp"');
-    expect(syntaxCheckStatement('/root/work/app.py')).toContain('ast.parse');
-    expect(syntaxCheckStatement('/root/work/config.json')).toContain('json.load');
-    expect(syntaxCheckStatement('/root/work/notes.md')).toBeUndefined();
-
+  it('uses sudo install with explicit owner for elevated writes', () => {
     const script = buildWriteScript({
-      path: '/root/work/app.sh',
-      mode: 'overwrite',
-      createDirs: false,
-      syntaxCheck: syntaxCheckStatement('/root/work/app.sh'),
+      ...writeOptions,
+      owner: { user: 'root', group: 'root' },
+      elevate: true,
     });
-    expect(script.indexOf('bash -n "$tmp"')).toBeGreaterThan(script.indexOf('base64 -d > "$tmp"'));
-    expect(script.indexOf('bash -n "$tmp"')).toBeLessThan(script.indexOf('mv -f "$tmp" "$target"'));
+    expect(script).toMatch(/^sudo -n sh -c /);
+    expect(script).toContain('install -m 0755 -o');
   });
 
-  it('reads a whole file or a line window', () => {
-    const whole = buildReadScript('/root/work/app.sh');
-    expect(whole).toContain(FS_CONTENT_SENTINEL);
-    expect(whole).toContain('cat "$target"');
+  it('bounds reads on the remote side before stdout reaches Node', () => {
+    const script = buildReadScript('/root/work/app.sh', 5, 10, 50);
+    expect(script).toContain(FS_CONTENT_SENTINEL);
+    expect(script).toContain('awk -v start=5 -v count=10');
+    expect(script).toContain('head -c 51');
+    expect(script).not.toContain('cat "$target"');
 
-    expect(buildReadScript('/root/work/app.sh', 5, 10)).toContain("sed -n '5,10p");
-    expect(buildReadScript('/root/work/app.sh', 5)).toContain("sed -n '5,$p");
+    const raw = buildRawReadScript('/root/work/app.sh', 100);
+    expect(raw).toContain('if [ "$size" -gt 100 ]');
+    expect(raw).toContain('head -c 101');
   });
 
-  it('builds a short run command from the file extension', () => {
-    expect(buildRunCommand('/root/work/app.sh')).toBe("bash '/root/work/app.sh'");
-    expect(buildRunCommand('/root/work/app.py')).toBe("python3 '/root/work/app.py'");
-    expect(buildRunCommand('/root/work/app.mjs')).toBe("node '/root/work/app.mjs'");
-    expect(buildRunCommand('/root/work/app.sh', undefined, 'sh')).toBe("sh '/root/work/app.sh'");
-    expect(buildRunCommand('/root/work/app.sh', 'bash /root/work/app.sh --dry-run')).toBe('bash /root/work/app.sh --dry-run');
-    expect(() => buildRunCommand('/root/work/app.sh', undefined, 'bash; rm -rf /')).toThrow(/unsupported characters/);
+  it('builds a quoted run command with args, cwd, env, and elevation', () => {
+    const command = buildRunCommand('/root/work/app.sh', 'bash', {
+      args: ['--name', 'two words'],
+      cwd: '/root/work',
+      env: { MODE: 'check' },
+      elevate: true,
+    });
+    expect(command).toContain('sudo -n sh -c');
+    expect(command).toContain("cd '/root/work'");
+    expect(command).toContain("MODE='check'");
+    expect(command).toContain("'two words'");
   });
 
   it('parses the remote result line', () => {
@@ -180,15 +187,17 @@ describe('remote script builders', () => {
       lineCount: 4,
     });
     expect(() => parseFsResultLine('no result here')).toThrow(/did not report a result/);
+    expect(parseWriteOutcome(`FS_UNCHANGED 12 ${digest}\\n`).unchanged).toBe(true);
   });
 });
 
 describe('runtime configuration and tool descriptors', () => {
   it('uses safe defaults', () => {
     const config = loadFsRuntimeConfig(env({}));
-    expect(config.enabled).toBe(true);
+    expect(config.enabled).toBe(false);
     expect(config.allowedRoots).toEqual([]);
     expect(config.maxBytes).toBe(DEFAULT_FS_MAX_BYTES);
+    expect(config.readMaxLines).toBe(DEFAULT_FS_READ_MAX_LINES);
     expect(config.syntaxCheckEnabled).toBe(true);
   });
 
@@ -212,9 +221,9 @@ describe('runtime configuration and tool descriptors', () => {
   });
 
   it('publishes the four file tools, and none when disabled', () => {
-    const config = loadFsRuntimeConfig(env({}));
+    const config = loadFsRuntimeConfig(env({ SSH_MCP_FS_TOOLS_ENABLED: '1', SSH_MCP_FS_ALLOWED_ROOTS: '/root/work' }));
     const names = fsToolDefinitions(config).map((tool) => tool.name);
-    expect(names).toEqual(['fs-write', 'fs-read', 'fs-patch', 'write-and-run']);
+    expect(names).toEqual(['fs-write', 'fs-read', 'fs-edit', 'run-script']);
     expect(names.every((name) => isFsToolName(String(name)))).toBe(true);
     expect(isFsToolName('exec')).toBe(false);
 
@@ -222,11 +231,11 @@ describe('runtime configuration and tool descriptors', () => {
   });
 
   it('keeps file bodies out of the audit log', () => {
-    const redacted = redactFsArgs({ path: '/root/work/app.sh', content: 'secret body', old_str: 'a', new_str: 'b' });
+    const redacted = redactFsArgs({ path: '/root/work/app.sh', content: 'secret body', old_string: 'a', new_string: 'b' });
     expect(redacted.path).toBe('/root/work/app.sh');
     expect(String(redacted.content)).toContain('11 chars');
     expect(String(redacted.content)).not.toContain('secret body');
-    expect(String(redacted.old_str)).toContain('1 chars');
-    expect(String(redacted.new_str)).toContain('1 chars');
+    expect(String(redacted.old_string)).toContain('1 chars');
+    expect(String(redacted.new_string)).toContain('1 chars');
   });
 });
