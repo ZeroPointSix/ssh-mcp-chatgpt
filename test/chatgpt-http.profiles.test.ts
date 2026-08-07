@@ -177,7 +177,7 @@ describe('ChatGPT HTTP SSH profiles', () => {
 
     const result = await invokeTool(
       'exec',
-      { target_id: 'prod', command: 'whoami', expire_time_ms: 1000, note: 'test explicit target' },
+      { target_id: 'prod', command: 'whoami', description: 'legacy note', expire_time_ms: 1000, note: 'test explicit target' },
       'session-1',
       config,
     );
@@ -185,7 +185,14 @@ describe('ChatGPT HTTP SSH profiles', () => {
     expect(result.status).toBe('completed');
     expect(result.target_id).toBe('prod');
     expect(result.target_label).toBe('Production VPS');
-    expect(mockState.connectCalls.at(-1)).toMatchObject({ host: '10.0.0.3', port: 22, username: 'root', password: 'prod-secret' });
+    expect(mockState.connectCalls.at(-1)).toMatchObject({
+      host: '10.0.0.3',
+      port: 22,
+      username: 'root',
+      password: 'prod-secret',
+      readyTimeout: 30000,
+    });
+    expect(mockState.execCalls.at(-1)).toBe('whoami');
   });
 
   it('uses the configured default profile when target_id is omitted', async () => {
