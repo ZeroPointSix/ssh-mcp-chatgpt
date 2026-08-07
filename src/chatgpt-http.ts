@@ -13,13 +13,14 @@ type JsonRpcId = string | number | null;
 type JsonObject = Record<string, unknown>;
 
 const SERVER_NAME = "ssh-mcp-chatgpt";
-const SERVER_VERSION = "1.5.0-chatgpt.0";
+const SERVER_VERSION = "1.6.0-chatgpt.0";
 const STREAMABLE_HTTP_ACCEPT = "application/json, text/event-stream";
-const MAX_BODY_BYTES = 1024 * 1024;
+const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const CODE_TTL_MS = 5 * 60 * 1000;
 const ACCESS_TOKEN_TTL_MS = 365 * 24 * 60 * 60 * 1000;
 const DEFAULT_EXEC_EXPIRE_TIME_MS = 55_000;
-const DEFAULT_EXEC_OUTPUT_MAX_CHARS = 200_000;
+const DEFAULT_EXEC_KILL_TIME_MS = 10 * 60 * 1000;
+const DEFAULT_EXEC_OUTPUT_MAX_CHARS = 100_000;
 const COMMAND_JOB_RETENTION_MS = 24 * 60 * 60 * 1000;
 
 const SERVER_INSTRUCTIONS = [
@@ -541,7 +542,7 @@ function loadRuntimeConfig(): RuntimeConfig {
     ) ?? DEFAULT_EXEC_EXPIRE_TIME_MS,
     execKillTimeMs: parseDurationMs(
       getEnv("SSH_MCP_EXEC_KILL_TIME_MS", "SSH_MCP_KILL_TIME_MS", "EXEC_KILL_TIME_MS"),
-      undefined,
+      DEFAULT_EXEC_KILL_TIME_MS,
       "SSH_MCP_EXEC_KILL_TIME_MS",
     ),
     execOutputMaxChars: parseOutputMaxChars(
@@ -749,12 +750,6 @@ function sanitizeCommand(command: string, maxChars: number): string {
   return trimmed;
 }
 
-function appendDescription(command: string, description?: string): string {
-  if (!description) return command;
-  const safeDescription = description.replace(/[\r\n]+/g, " ").replace(/#/g, "\\#");
-  return `${command} # ${safeDescription}`;
-}
-
 function shellSingleQuote(value: string): string {
   return value.replace(/'/g, "'\\''");
 }
@@ -768,6 +763,25 @@ function outputLimitPayload(maxChars: number): number | "none" {
   return Number.isFinite(maxChars) ? maxChars : "none";
 }
 
+function appendBoundedOutput(current: string, chunk: string, totalChars: number, maxChars: number): string {
+  if (!Number.isFinite(maxChars)) return current + chunk;
+  const combined = current + chunk;
+  if (totalChars <= maxChars) return combined;
+  if (maxChars < 64) return combined.slice(-maxChars);
+
+  const markerPattern = /\n\[\.\.\. \d+ chars omitted \.\.\.\]\n/;
+  const parts = current.split(markerPattern);
+  const priorHead = parts[0] ?? "";
+  const priorTail = parts.length > 1 ? parts[parts.length - 1] ?? "" : current;
+  const visibleChars = maxChars - 64;
+  const headLimit = Math.ceil(visibleChars / 2);
+  const tailLimit = Math.floor(visibleChars / 2);
+  const head = priorHead.slice(0, headLimit);
+  const tail = (priorTail + chunk).slice(-tailLimit);
+  const omitted = Math.max(0, totalChars - head.length - tail.length);
+  return `${head}\n[... ${omitted} chars omitted ...]\n${tail}`;
+}
+
 function appendCommandJobOutput(job: CommandJob, streamName: "stdout" | "stderr", data: Buffer): void {
   const chunk = data.toString();
   const maxChars = job.outputMaxChars;
@@ -775,13 +789,8 @@ function appendCommandJobOutput(job: CommandJob, streamName: "stdout" | "stderr"
   if (streamName === "stdout") {
     job.stdoutChars += chunk.length;
     if (Number.isFinite(maxChars)) {
-      const combined = job.stdout + chunk;
-      if (combined.length > maxChars) {
-        job.stdout = combined.slice(combined.length - maxChars);
-        job.stdoutTruncated = true;
-      } else {
-        job.stdout = combined;
-      }
+      job.stdout = appendBoundedOutput(job.stdout, chunk, job.stdoutChars, maxChars);
+      job.stdoutTruncated = job.stdoutChars > maxChars;
       return;
     }
     job.stdout += chunk;
@@ -790,13 +799,8 @@ function appendCommandJobOutput(job: CommandJob, streamName: "stdout" | "stderr"
 
   job.stderrChars += chunk.length;
   if (Number.isFinite(maxChars)) {
-    const combined = job.stderr + chunk;
-    if (combined.length > maxChars) {
-      job.stderr = combined.slice(combined.length - maxChars);
-      job.stderrTruncated = true;
-    } else {
-      job.stderr = combined;
-    }
+    job.stderr = appendBoundedOutput(job.stderr, chunk, job.stderrChars, maxChars);
+    job.stderrTruncated = job.stderrChars > maxChars;
     return;
   }
   job.stderr += chunk;
@@ -860,6 +864,14 @@ function failCommandJob(job: CommandJob, error: string): void {
     return;
   }
   finishCommandJob(job, { status: "failed", error });
+}
+
+function redactSshConnectionError(message: string): string {
+  return message
+    .replace(/\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b/g, "[redacted-target]")
+    .replace(/\[[0-9a-f:]+\](?::\d+)?/gi, "[redacted-target]")
+    .replace(/\b(ENOTFOUND|EAI_AGAIN)\s+\S+/gi, "$1 [redacted-target]")
+    .replace(/\b(connect\s+\S+)\s+\S+:\d+\b/gi, "$1 [redacted-target]");
 }
 
 function finalizeStoppedCommandJob(job: CommandJob): void {
@@ -957,6 +969,7 @@ function startSshCommandJob(
       stream.stderr.on("data", (data: Buffer) => {
         appendCommandJobOutput(job, "stderr", data);
       });
+      stream.end();
       stream.on("close", (code: number | null, signal: string | null) => {
         if (isTerminalJobStatus(job.status)) return;
         job.exitCode = code;
@@ -965,17 +978,13 @@ function startSshCommandJob(
           finalizeStoppedCommandJob(job);
           return;
         }
-        if (code === 0 && !signal) {
-          finishCommandJob(job, { status: "completed" });
-        } else {
-          failCommandJob(job, `Error (${formatSshExitStatus(code, signal)}):\n${job.stderr || job.stdout}`);
-        }
+        finishCommandJob(job, { status: "completed" });
       });
     });
   });
 
   conn.on("error", (err: Error) => {
-    failCommandJob(job, `SSH connection error: ${err.message}`);
+    failCommandJob(job, `SSH connection error: ${redactSshConnectionError(err.message)}`);
   });
   conn.on("close", () => {
     if (isTerminalJobStatus(job.status)) return;
@@ -1040,6 +1049,7 @@ async function loadProfileSshConfig(profile: SshProfileConfig): Promise<SSHConfi
     host: profile.host,
     port: profile.port,
     username: profile.username,
+    readyTimeout: 30_000,
   };
   if (profile.password) {
     config.password = profile.password;
@@ -1068,6 +1078,7 @@ async function loadSshConfig(target: ResolvedSshTarget): Promise<SSHConfig> {
     host,
     port: parseInteger(getEnv("SSH_MCP_PORT", "SSH_PORT"), 22, "SSH_MCP_PORT"),
     username: user,
+    readyTimeout: 30_000,
   };
 
   const password = getRawEnv("SSH_MCP_PASSWORD", "SSH_PASSWORD");
@@ -1087,12 +1098,10 @@ async function loadSshConfig(target: ResolvedSshTarget): Promise<SSHConfig> {
 
 async function runSshTool(name: "exec" | "sudo-exec", args: JsonObject, config: RuntimeConfig, target: ResolvedSshTarget): Promise<JsonObject> {
   const command = sanitizeCommand(requireString(args.command, "command"), config.maxChars);
-  const description = optionalString(args.description);
-  const commandWithDescription = appendDescription(command, description);
   const expireTimeMs = parseDurationArg(args.expire_time_ms, config.execExpireTimeMs, "expire_time_ms") ?? config.execExpireTimeMs;
   const killTimeMs = parseDurationArg(args.kill_time_ms, config.execKillTimeMs, "kill_time_ms");
 
-  let remoteCommand = commandWithDescription;
+  let remoteCommand = command;
   if (name === "sudo-exec") {
     if (config.disableSudo) {
       throw new AppError(403, "sudo-exec is disabled on this deployment", "SUDO_DISABLED");
@@ -1100,7 +1109,7 @@ async function runSshTool(name: "exec" | "sudo-exec", args: JsonObject, config: 
     if (!target.sudoEnabled) {
       throw new AppError(403, `sudo-exec is disabled for SSH target ${target.id}`, "SUDO_DISABLED");
     }
-    const quotedCommand = shellSingleQuote(commandWithDescription);
+    const quotedCommand = shellSingleQuote(command);
     if (config.sudoPassword) {
       remoteCommand = `printf '%s\\n' '${shellSingleQuote(config.sudoPassword)}' | sudo -p "" -S sh -c '${quotedCommand}'`;
     } else {

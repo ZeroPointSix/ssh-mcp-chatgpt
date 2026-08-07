@@ -40,9 +40,9 @@ describe('ChatGPT HTTP background command tools', () => {
     const toolNames = listTools(config).map((tool: any) => tool.name);
 
     expect(health.max_command_chars).toBe('none');
-    expect(health.default_output_max_chars).toBe(200000);
+    expect(health.default_output_max_chars).toBe(100000);
     expect(health.default_expire_time_ms).toBe(55000);
-    expect(health.default_kill_time_ms).toBe('none');
+    expect(health.default_kill_time_ms).toBe(600000);
     expect(toolNames).toEqual(expect.arrayContaining(['exec', 'exec-status', 'exec-cancel']));
   });
 
@@ -71,6 +71,26 @@ describe('ChatGPT HTTP background command tools', () => {
     expect(current.stdout).toContain('background-done');
     expect(current.stderr).toBe('');
     expect(current.exit_code).toBe(0);
+  }, 10000);
+
+  it('closes stdin and reports non-zero exits as completed command results', async () => {
+    configureSshTarget();
+    const config = loadRuntimeConfig();
+
+    const result = await invokeTool(
+      'exec',
+      {
+        command: 'sh -c "cat >/dev/null; exit 7"',
+        expire_time_ms: 5000,
+        note: 'verify stdin closure and exit status',
+      },
+      'test-session',
+      config,
+    );
+
+    expect(result.status).toBe('completed');
+    expect(result.exit_code).toBe(7);
+    expect(result.error).toBeUndefined();
   }, 10000);
 
   it('retains only bounded output tails with truncation metadata', async () => {
