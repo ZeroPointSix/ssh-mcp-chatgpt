@@ -941,7 +941,9 @@ function finishCommandJob(job: CommandJob, updates: Partial<CommandJob>): void {
 
 function failCommandJob(job: CommandJob, error: string): void {
   if (job.stopRequestedStatus) {
-    finishCommandJob(job, { status: job.stopRequestedStatus, error: job.stopReason ?? error });
+    if (!job.stop) {
+      finishCommandJob(job, { status: job.stopRequestedStatus, error: job.stopReason ?? error });
+    }
     return;
   }
   finishCommandJob(job, { status: "failed", error });
