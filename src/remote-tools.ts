@@ -78,6 +78,7 @@ export interface PreparedScript {
   commandLength: number;
   stdin?: string;
   timeoutMs?: number;
+  cleanup?: () => Promise<void>;
 }
 
 interface CommandResult {
@@ -307,6 +308,21 @@ function sftpReadFile(sftp: SFTPWrapper, path: string): Promise<Buffer> {
   });
 }
 
+function sftpStat(
+  sftp: SFTPWrapper,
+  path: string,
+): Promise<{ size: number; mode: number; uid: number; gid: number }> {
+  return new Promise((resolve, reject) => {
+    sftp.stat(path, (error, attrs) => {
+      if (error) {
+        reject(new RemoteToolError("stat", "Unable to inspect remote file"));
+        return;
+      }
+      resolve({ size: attrs.size, mode: attrs.mode, uid: attrs.uid, gid: attrs.gid });
+    });
+  });
+}
+
 function sftpWriteFile(sftp: SFTPWrapper, path: string, content: Buffer): Promise<void> {
   return new Promise((resolve, reject) => {
     sftp.writeFile(path, content, { mode: 0o600 }, (error) => {
@@ -354,6 +370,18 @@ async function readBuffer(
   context: RemoteToolContext,
 ): Promise<Buffer> {
   if (elevate) {
+    const sizeResult = await checkedCommand(
+      conn,
+      commandForElevation("stat -c %s -- " + quoteShell(path), true, context),
+      "stat",
+    );
+    const size = Number(sizeResult.stdout.toString("utf8").trim());
+    if (!Number.isSafeInteger(size) || size < 0) {
+      throw new RemoteToolError("stat", "Remote file size is invalid");
+    }
+    if (size > MAX_REMOTE_FILE_BYTES) {
+      throw new RemoteToolError("read", "Remote file exceeds 8 MiB");
+    }
     const result = await checkedCommand(
       conn,
       commandForElevation("cat -- " + quoteShell(path), true, context),
@@ -365,7 +393,41 @@ async function readBuffer(
     return result.stdout;
   }
   const sftp = await openSftp(conn);
+  const attrs = await sftpStat(sftp, path);
+  if (attrs.size > MAX_REMOTE_FILE_BYTES) {
+    throw new RemoteToolError("read", "Remote file exceeds 8 MiB");
+  }
   return sftpReadFile(sftp, path);
+}
+
+async function remoteFileMetadata(
+  conn: Client,
+  path: string,
+  elevate: boolean,
+  context: RemoteToolContext,
+): Promise<{ mode: string; uid: number; gid: number }> {
+  if (!elevate) {
+    const attrs = await sftpStat(await openSftp(conn), path);
+    return {
+      mode: (attrs.mode & 0o7777).toString(8).padStart(4, "0"),
+      uid: attrs.uid,
+      gid: attrs.gid,
+    };
+  }
+  const result = await checkedCommand(
+    conn,
+    commandForElevation("stat -c '%a %u %g' -- " + quoteShell(path), true, context),
+    "stat",
+  );
+  const [rawMode, rawUid, rawGid] = result.stdout.toString("utf8").trim().split(/\s+/);
+  const uid = Number(rawUid);
+  const gid = Number(rawGid);
+  const mode = rawMode?.padStart(4, "0");
+  if (!mode || !Number.isSafeInteger(uid) || !Number.isSafeInteger(gid)) {
+    throw new RemoteToolError("stat", "Remote file metadata is invalid");
+  }
+  assertMode(mode);
+  return { mode, uid, gid };
 }
 
 async function remoteHash(
@@ -513,9 +575,19 @@ async function writeBuffer(
     );
   }
 
-  const mode = options.mode ?? "0644";
+  const currentMetadata = currentHash
+    ? await remoteFileMetadata(conn, targetPath, elevate, context)
+    : undefined;
+  const mode = options.mode ?? currentMetadata?.mode ?? "0644";
   assertMode(mode);
-  const owner = parseOwner(options.owner ?? (elevate ? "root:root" : context.sshConfig.username));
+  const owner = parseOwner(
+    options.owner ??
+      (currentMetadata
+        ? currentMetadata.uid + ":" + currentMetadata.gid
+        : elevate
+          ? "root:root"
+          : context.sshConfig.username),
+  );
   const stagingRoot = remoteWorkspaceRoot(context, "staging");
   await ensureStagingDirectory(conn, stagingRoot, elevate, context);
   const stagingPath = stagingRoot + "/" + randomUUID();
@@ -829,6 +901,17 @@ export async function prepareRemoteScript(
         commandLength: hasContent ? (options.content ?? "").length : command.length,
         stdin: options.stdin,
         timeoutMs: options.timeoutMs,
+        cleanup: staged
+          ? async () => {
+              await withClient(context.sshConfig, async (cleanupConn) => {
+                await checkedCommand(
+                  cleanupConn,
+                  commandForElevation("rm -f -- " + quoteShell(scriptPath), elevate, context),
+                  "cleanup",
+                );
+              });
+            }
+          : undefined,
       };
     } catch (error) {
       if (staged && sftp) await sftpUnlink(sftp, scriptPath);
