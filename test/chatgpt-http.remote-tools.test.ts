@@ -123,6 +123,13 @@ describe('Claude Code-style remote tools', () => {
     expect(written.bytes_written).toBeGreaterThan(0);
     expect(written.sha256).toMatch(/^[a-f0-9]{64}$/);
 
+    await invokeTool(
+      'exec',
+      { command: "chmod 0600 -- '" + path + "'", note: 'restrict file permissions' },
+      'test-session',
+      config,
+    );
+
     const firstRead = await invokeTool(
       'fs-read',
       { path, note: 'read test file' },
@@ -147,6 +154,14 @@ describe('Claude Code-style remote tools', () => {
     expect(edited.replacements).toBe(1);
     expect(edited.sha256).not.toBe(firstRead.sha256);
     expect(edited.backup_path).toMatch(/^\/tmp\/ssh-mcp-tools-.+\.bak\.\d{14}$/);
+
+    const editedMode = await invokeTool(
+      'exec',
+      { command: "stat -c '%a' -- '" + path + "'", note: 'verify preserved file mode' },
+      'test-session',
+      config,
+    );
+    expect(String(editedMode.stdout).trim()).toBe('600');
 
     const backupRead = await invokeTool(
       'fs-read',
@@ -190,6 +205,28 @@ describe('Claude Code-style remote tools', () => {
     await invokeTool(
       'exec',
       { command: "rm -rf -- '" + root + "'", note: 'clean remote test files' },
+      'test-session',
+      config,
+    );
+  }, 30000);
+
+  it('rejects oversized files before reading their content', async () => {
+    configureSshTarget();
+    const config = loadRuntimeConfig();
+    const path = '/tmp/ssh-mcp-oversized-' + Date.now() + '.txt';
+
+    await invokeTool(
+      'exec',
+      { command: "truncate -s 9437184 -- '" + path + "'", note: 'prepare oversized file' },
+      'test-session',
+      config,
+    );
+    await expect(
+      invokeTool('fs-read', { path, note: 'reject oversized file' }, 'test-session', config),
+    ).rejects.toMatchObject({ stage: 'read' });
+    await invokeTool(
+      'exec',
+      { command: "rm -f -- '" + path + "'", note: 'clean oversized file' },
       'test-session',
       config,
     );
@@ -252,6 +289,17 @@ describe('Claude Code-style remote tools', () => {
     expect(result.status).toBe('completed');
     expect(result.exit_code).toBe(0);
     expect(result.stdout).toBe('ok-input-1\nok-input-2\n');
+
+    const stagedFiles = await invokeTool(
+      'exec',
+      {
+        command: "find '" + remoteWorkspaceRoot({ sshConfig: { username: process.env.SSH_MCP_USER || 'test' } } as any, 'scripts') + "' -type f -print -quit",
+        note: 'verify staged script cleanup',
+      },
+      'test-session',
+      config,
+    );
+    expect(String(stagedFiles.stdout).trim()).toBe('');
 
     await expect(
       invokeTool(
