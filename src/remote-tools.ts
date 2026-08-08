@@ -92,12 +92,49 @@ function quoteShell(value: string): string {
   return "'" + value.replace(/'/g, "'\\''") + "'";
 }
 
-export function wrapManagedRemoteCommand(command: string, options: { usesStdin?: boolean } = {}): string {
-  void options;
+const MANAGED_JOB_ROOT = "/tmp/.mcp/jobs";
+
+function managedJobPidPath(jobId: string): string {
+  if (!/^job-[A-Za-z0-9_-]+$/.test(jobId)) {
+    throw new RemoteToolError("policy", "Invalid managed job ID");
+  }
+  return MANAGED_JOB_ROOT + "/" + jobId + ".pid";
+}
+
+export function wrapManagedRemoteCommand(
+  command: string,
+  options: { usesStdin?: boolean; jobId?: string } = {},
+): string {
+  void options.usesStdin;
+  const pidPath = options.jobId ? managedJobPidPath(options.jobId) : undefined;
+  const setup = pidPath
+    ? "pid_file=" + quoteShell(pidPath) +
+      "; umask 077; mkdir -p " + quoteShell(MANAGED_JOB_ROOT) +
+      "; printf '%s\\n' \"$$\" > \"$pid_file\"" +
+      "; trap 'rm -f -- \"$pid_file\"' EXIT; "
+    : "";
   const inner =
-    "trap 'kill -TERM 0 2>/dev/null; kill -KILL 0 2>/dev/null; exit 143' TERM INT; " +
+    setup +
+    "trap 'trap \"\" TERM; kill -TERM -- -$$ 2>/dev/null || true; trap - TERM INT HUP; exit 143' TERM INT HUP; " +
     command +
     "\nexit $?";
+  return "setsid bash -c " + quoteShell(inner);
+}
+
+export function buildManagedRemoteCancelCommand(jobId: string): string {
+  const pidPath = managedJobPidPath(jobId);
+  const inner = [
+    "pid_file=" + quoteShell(pidPath),
+    "attempt=0",
+    "while [ ! -s \"$pid_file\" ] && [ \"$attempt\" -lt 20 ]; do attempt=$((attempt + 1)); sleep 0.05; done",
+    "[ -s \"$pid_file\" ] || exit 3",
+    "pid=$(cat -- \"$pid_file\")",
+    "case \"$pid\" in ''|*[!0-9]*) exit 4 ;; esac",
+    "kill -TERM -- \"-$pid\" 2>/dev/null || true",
+    "sleep 0.25",
+    "kill -KILL -- \"-$pid\" 2>/dev/null || true",
+    "rm -f -- \"$pid_file\"",
+  ].join("; ");
   return "bash -c " + quoteShell(inner);
 }
 
