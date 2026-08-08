@@ -6,7 +6,7 @@ import type { SSHConfig } from "./index.js";
 const MAX_REMOTE_FILE_BYTES = 8 * 1024 * 1024;
 const MCP_USER_ROOT = "/tmp/.mcp/users";
 
-export function remoteWorkspaceRoot(context: RemoteToolContext, kind: "staging" | "scripts"): string {
+export function remoteWorkspaceRoot(context: RemoteToolContext, kind: "staging" | "scripts" | "jobs"): string {
   const safeUser = context.sshConfig.username.replace(/[^A-Za-z0-9_.-]/g, "_") || "unknown";
   return `${MCP_USER_ROOT}/${safeUser}/${kind}`;
 }
@@ -92,13 +92,65 @@ function quoteShell(value: string): string {
   return "'" + value.replace(/'/g, "'\\''") + "'";
 }
 
-export function wrapManagedRemoteCommand(command: string, options: { usesStdin?: boolean } = {}): string {
-  void options;
-  const inner =
-    "trap 'kill -TERM 0 2>/dev/null; kill -KILL 0 2>/dev/null; exit 143' TERM INT; " +
-    command +
-    "\nexit $?";
-  return "bash -c " + quoteShell(inner);
+export function managedRemoteCommandControlPath(username: string, jobId: string): string {
+  if (!/^[A-Za-z0-9_.-]+$/.test(jobId)) {
+    throw new RemoteToolError("policy", "job_id contains unsupported characters");
+  }
+  const safeUser = username.replace(/[^A-Za-z0-9_.-]/g, "_") || "unknown";
+  return MCP_USER_ROOT + "/" + safeUser + "/jobs/" + jobId + ".pid";
+}
+
+export function buildManagedRemoteCancelCommand(controlPath: string): string {
+  const script = [
+    "control_path=" + quoteShell(controlPath),
+    'finish_cancel() { rm -f -- "$control_path"; exit 0; }',
+    "for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do",
+    '  [ -s "$control_path" ] && break',
+    "  sleep 0.05",
+    "done",
+    '[ -s "$control_path" ] || exit 0',
+    'IFS= read -r managed_pid < "$control_path" || exit 0',
+    'case "$managed_pid" in ""|*[!0-9]*) exit 65 ;; esac',
+    '[ "$managed_pid" -gt 1 ] || exit 65',
+    'kill -0 -- "-$managed_pid" 2>/dev/null || finish_cancel',
+    'kill -TERM -- "-$managed_pid" 2>/dev/null || true',
+    "for attempt in 1 2 3 4 5 6 7 8 9 10; do",
+    '  kill -0 -- "-$managed_pid" 2>/dev/null || finish_cancel',
+    "  sleep 0.1",
+    "done",
+    'kill -KILL -- "-$managed_pid" 2>/dev/null || true',
+    "for attempt in 1 2 3 4 5 6 7 8 9 10; do",
+    '  kill -0 -- "-$managed_pid" 2>/dev/null || finish_cancel',
+    "  sleep 0.1",
+    "done",
+    "exit 70",
+  ].join("\n");
+  return "bash -c " + quoteShell(script);
+}
+
+export function wrapManagedRemoteCommand(
+  command: string,
+  options: { usesStdin?: boolean; controlPath?: string } = {},
+): string {
+  if (!options.controlPath) {
+    return "bash -c " + quoteShell(command + "\nexit $?");
+  }
+
+  const controlDirectory = pathPosix.dirname(options.controlPath);
+  const stdinRedirect = options.usesStdin ? " <&0" : " </dev/null";
+  const outer = [
+    "umask 077",
+    "mkdir -p -- " + quoteShell(controlDirectory),
+    "rm -f -- " + quoteShell(options.controlPath),
+    "setsid bash -c " + quoteShell(command) + stdinRedirect + " &",
+    "managed_pid=$!",
+    "printf '%s\\n' \"$managed_pid\" > " + quoteShell(options.controlPath),
+    'wait "$managed_pid"',
+    "managed_status=$?",
+    "rm -f -- " + quoteShell(options.controlPath),
+    'exit "$managed_status"',
+  ].join("\n");
+  return "bash -c " + quoteShell(outer);
 }
 
 export function buildSyntaxCheckCommand(interpreter: ScriptInterpreter, path: string): string {
@@ -280,6 +332,21 @@ async function checkedCommand(
     });
   }
   return result;
+}
+
+export async function cancelManagedRemoteCommand(
+  sshConfig: SSHConfig,
+  controlPath: string,
+): Promise<void> {
+  await withClient(sshConfig, async (conn) => {
+    await checkedCommand(
+      conn,
+      buildManagedRemoteCancelCommand(controlPath),
+      "cancel",
+      undefined,
+      10_000,
+    );
+  });
 }
 
 function openSftp(conn: Client): Promise<SFTPWrapper> {
