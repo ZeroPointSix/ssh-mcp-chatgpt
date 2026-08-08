@@ -17,7 +17,7 @@ from host_registry import (
 KOREA_OPT = "/opt/ssh-mcp-chatgpt-korea"
 KOREA_ENV = f"{KOREA_OPT}/env"
 KOREA_DATA = f"{KOREA_OPT}/data"  # must match SSH_MCP_DATA_DIR in env (oauth-clients.json lives here)
-IMAGE = "guangshanshui/ssh-mcp-chatgpt:pr8-4d4f"
+IMAGE = "ghcr.io/zeropointsix/ssh-mcp-chatgpt:1.6.6-chatgpt.0"
 
 
 def main() -> int:

@@ -2,7 +2,7 @@
 
 This document records **which DigitalOcean droplets run which public MCP services**. It is maintained from deploy scripts and live probes, not from assumptions about “Singapore vs NYC”.
 
-Last verified: **2026-06-18** (DO metadata `region`, nginx `server_name`, public `/health`).
+Last verified: **2026-08-08** (public `/health`, Korea container image).
 
 ## Local clone vs remote server tree
 
@@ -31,7 +31,7 @@ Production connector behavior is defined by the **running image** on 137 (today 
 - **TLS:** Let's Encrypt on VM (gray cloud); HTTP 301 → HTTPS
 - **OAuth:** Bare `GET /authorize` without ChatGPT query → 200 help page (expected); see [CHATGPT.md](./CHATGPT.md)
 - **OpenResty (1Panel):** `/opt/1panel/www/conf.d/ssh.zerodotsix.top.conf` → `proxy_pass http://127.0.0.1:3039`
-- **Container:** `ssh-mcp-chatgpt-korea`, image `guangshanshui/ssh-mcp-chatgpt:pr8-4d4f`, `--network host`, env `/opt/ssh-mcp-chatgpt-korea/env`
+- **Container:** `ssh-mcp-chatgpt-korea`, image `ghcr.io/zeropointsix/ssh-mcp-chatgpt:1.6.6-chatgpt.0`, `--network host`, env `/opt/ssh-mcp-chatgpt-korea/env`
 - **OAuth / data:** `SSH_MCP_DATA_DIR` = **`/opt/ssh-mcp-chatgpt-korea/data`**（bind mount 同路径）；`oauth-clients.json` 须在此目录。改 env 或 data 路径后 **重建容器**（`recreate-korea-ssh-mcp-container.py` / `fix-korea-oauth-data-path.py`），**不要**只 `docker restart` — 见 [DOCKER-ENV-FILE-RECREATE.md](./DOCKER-ENV-FILE-RECREATE.md)
 - **Profiles file:** `/opt/ssh-mcp-chatgpt-korea/profiles.json` — **9** `server_id`s (`azure-kr-001` … `do-nyc-001`); default `azure-kr-001` = `hu@127.0.0.1` on Korea
 - **Setup scripts:** `setup-korea-ssh-zerodotsix.py`, `finish-korea-ssl-ssh-zerodotsix.py`, `sync-korea-oauth-clients.py` (OAuth dynamic clients in `oauth-clients.json`)

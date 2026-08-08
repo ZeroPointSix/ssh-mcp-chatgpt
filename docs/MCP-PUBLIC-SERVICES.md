@@ -8,7 +8,7 @@
 
 | 公网域名 | 服务名（health `name`） | 版本（实测） | 宿主机 `server_id` | 区域 | 角色 |
 | -------- | ---------------------- | ------------ | ------------------ | ---- | ---- |
-| `https://ssh.zerodotsix.top` | **ssh-mcp-chatgpt** | 1.5.0-chatgpt.0 | **azure-kr-001** `20.196.72.18` | Azure 韩国 | **生产**：多 VPS SSH，`list-profiles` + `exec` / `sudo-exec`，9 路 `server_id` |
+| `https://ssh.zerodotsix.top` | **ssh-mcp-chatgpt** | 1.6.6-chatgpt.0 | **azure-kr-001** `20.196.72.18` | Azure 韩国 | **生产**：多 VPS SSH，`list-profiles` + `exec` / `sudo-exec`，18 路 `server_id` |
 | `https://tmp1.zerodotsix.top` | **chrome-devtools-mcp** | 1.2.0 | **do-nyc-001** `137.184.23.118` | DO NYC | **测试**：无头 Chrome，页面/截图/DevTools 类工具 |
 | `https://tmp2.zerodotsix.top` | **memory-mcp-chatgpt** | 0.6.4-chatgpt.0 | **do-nyc-001** `137.184.23.118` | DO NYC | **测试**：记忆/知识库 MCP（非 SSH、非浏览器） |
 | `https://mcp.zerodotsix.top` | remote-dev-mcp（health 无统一 name） | 0.1.37 | **do-sgp-001** `139.59.96.181` | DO 新加坡 | **另一项目**：远程开发/工作区容器，**不是** ssh-mcp |
