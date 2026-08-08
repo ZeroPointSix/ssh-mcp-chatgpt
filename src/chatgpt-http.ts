@@ -24,7 +24,7 @@ type JsonRpcId = string | number | null;
 type JsonObject = Record<string, unknown>;
 
 const SERVER_NAME = "ssh-mcp-chatgpt";
-const SERVER_VERSION = "1.6.4-chatgpt.0";
+const SERVER_VERSION = "1.6.5-chatgpt.0";
 const STREAMABLE_HTTP_ACCEPT = "application/json, text/event-stream";
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const CODE_TTL_MS = 5 * 60 * 1000;
@@ -951,7 +951,9 @@ function finishCommandJob(job: CommandJob, updates: Partial<CommandJob>): void {
 
 function failCommandJob(job: CommandJob, error: string): void {
   if (job.stopRequestedStatus) {
-    finishCommandJob(job, { status: job.stopRequestedStatus, error: job.stopReason ?? error });
+    if (!job.stopControlStarted) {
+      finishCommandJob(job, { status: job.stopRequestedStatus, error: job.stopReason ?? error });
+    }
     return;
   }
   finishCommandJob(job, { status: "failed", error });
@@ -1171,7 +1173,7 @@ function startSshCommandJob(
         job.exitCode = code;
         job.signal = signal;
         if (job.stopRequestedStatus) {
-          finalizeStoppedCommandJob(job);
+          if (!job.stopControlStarted) finalizeStoppedCommandJob(job);
           return;
         }
         finishCommandJob(job, { status: "completed" });
@@ -1185,7 +1187,7 @@ function startSshCommandJob(
   conn.on("close", () => {
     if (isTerminalJobStatus(job.status)) return;
     if (job.stopRequestedStatus) {
-      finalizeStoppedCommandJob(job);
+      if (!job.stopControlStarted) finalizeStoppedCommandJob(job);
       return;
     }
     if (job.status === "running") {
