@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { posix as pathPosix } from "node:path";
 import { Client, type ClientChannel, type SFTPWrapper } from "ssh2";
 import type { SSHConfig } from "./index.js";
+import { withSshConnection } from "./ssh-connection-pool.js";
 
 const MAX_REMOTE_FILE_BYTES = 8 * 1024 * 1024;
 const MCP_USER_ROOT = "/tmp/.mcp/users";
@@ -183,147 +184,14 @@ function commandForElevation(command: string, elevate: boolean, context: RemoteT
   return elevate ? elevateCommand(command, context.sudoPassword) : command;
 }
 
-function connectSsh(config: SSHConfig): Promise<Client> {
-  return new Promise((resolve, reject) => {
-    const conn = new Client();
-    let settled = false;
-    conn.once("ready", () => {
-      settled = true;
-      resolve(conn);
-    });
-    conn.once("error", (error: Error) => {
-      if (!settled) reject(new RemoteToolError("connect", "SSH connection failed"));
-    });
-    conn.connect(config);
-  });
-}
-
 async function withClient<T>(config: SSHConfig, callback: (conn: Client) => Promise<T>): Promise<T> {
-  const conn = await connectSsh(config);
   try {
-    return await callback(conn);
-  } finally {
-    try {
-      conn.end();
-    } catch {
-      // Ignore connection cleanup errors.
-    }
+    return await withSshConnection(config, callback);
+  } catch (error) {
+    if (error instanceof RemoteToolError) throw error;
+    throw new RemoteToolError("connect", "SSH connection failed");
   }
 }
-
-function execCommand(
-  conn: Client,
-  command: string,
-  stdin?: string,
-  timeoutMs = 60_000,
-): Promise<CommandResult> {
-  return new Promise((resolve, reject) => {
-    conn.exec(command, (error: Error | undefined, stream: ClientChannel) => {
-      if (error) {
-        reject(new RemoteToolError("exec", "Failed to start remote command"));
-        return;
-      }
-
-      const stdout: Buffer[] = [];
-      const stderr: Buffer[] = [];
-      let stdoutBytes = 0;
-      let stderrBytes = 0;
-      let settled = false;
-      const timer = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        try {
-          stream.close();
-        } catch {
-          // Ignore close errors after timeout.
-        }
-        reject(new RemoteToolError("timeout", "Remote command exceeded timeout_ms"));
-      }, timeoutMs);
-      timer.unref?.();
-
-      const append = (chunks: Buffer[], chunk: Buffer, currentBytes: number): number => {
-        const nextBytes = currentBytes + chunk.length;
-        if (nextBytes > MAX_REMOTE_FILE_BYTES) {
-          throw new RemoteToolError("output", "Remote command output exceeded 8 MiB");
-        }
-        chunks.push(Buffer.from(chunk));
-        return nextBytes;
-      };
-
-      stream.on("data", (chunk: Buffer) => {
-        try {
-          stdoutBytes = append(stdout, chunk, stdoutBytes);
-        } catch (cause) {
-          if (!settled) {
-            settled = true;
-            clearTimeout(timer);
-            try {
-              stream.close();
-            } catch {
-              // Ignore close errors after output overflow.
-            }
-            reject(cause);
-          }
-        }
-      });
-      stream.stderr.on("data", (chunk: Buffer) => {
-        try {
-          stderrBytes = append(stderr, chunk, stderrBytes);
-        } catch (cause) {
-          if (!settled) {
-            settled = true;
-            clearTimeout(timer);
-            try {
-              stream.close();
-            } catch {
-              // Ignore close errors after output overflow.
-            }
-            reject(cause);
-          }
-        }
-      });
-      stream.on("error", () => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        reject(new RemoteToolError("exec", "Remote command channel failed"));
-      });
-      stream.on("close", (exitCode: number | null, signal: string | null) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        resolve({
-          exitCode,
-          signal,
-          stdout: Buffer.concat(stdout),
-          stderr: Buffer.concat(stderr),
-        });
-      });
-
-      if (stdin === undefined) stream.end();
-      else stream.end(stdin);
-    });
-  });
-}
-
-async function checkedCommand(
-  conn: Client,
-  command: string,
-  stage: string,
-  stdin?: string,
-  timeoutMs?: number,
-): Promise<CommandResult> {
-  const result = await execCommand(conn, command, stdin, timeoutMs);
-  if (result.exitCode !== 0 || result.signal) {
-    const detail = (result.stderr.length ? result.stderr : result.stdout).toString("utf8").trim();
-    throw new RemoteToolError(stage, detail || "Remote command failed", {
-      exit_code: result.exitCode,
-      signal: result.signal,
-    });
-  }
-  return result;
-}
-
 function openSftp(conn: Client): Promise<SFTPWrapper> {
   return new Promise((resolve, reject) => {
     conn.sftp((error, sftp) => {
@@ -435,11 +303,15 @@ async function readBuffer(
     return result.stdout;
   }
   const sftp = await openSftp(conn);
-  const attrs = await sftpStat(sftp, path);
-  if (attrs.size > MAX_REMOTE_FILE_BYTES) {
-    throw new RemoteToolError("read", "Remote file exceeds 8 MiB");
+  try {
+    const attrs = await sftpStat(sftp, path);
+    if (attrs.size > MAX_REMOTE_FILE_BYTES) {
+      throw new RemoteToolError("read", "Remote file exceeds 8 MiB");
+    }
+    return await sftpReadFile(sftp, path);
+  } finally {
+    sftp.end();
   }
-  return sftpReadFile(sftp, path);
 }
 
 async function remoteFileMetadata(
@@ -449,12 +321,17 @@ async function remoteFileMetadata(
   context: RemoteToolContext,
 ): Promise<{ mode: string; uid: number; gid: number }> {
   if (!elevate) {
-    const attrs = await sftpStat(await openSftp(conn), path);
-    return {
-      mode: (attrs.mode & 0o7777).toString(8).padStart(4, "0"),
-      uid: attrs.uid,
-      gid: attrs.gid,
-    };
+    const sftp = await openSftp(conn);
+    try {
+      const attrs = await sftpStat(sftp, path);
+      return {
+        mode: (attrs.mode & 0o7777).toString(8).padStart(4, "0"),
+        uid: attrs.uid,
+        gid: attrs.gid,
+      };
+    } finally {
+      sftp.end();
+    }
   }
   const result = await checkedCommand(
     conn,
@@ -691,7 +568,11 @@ async function writeBuffer(
       ...(createdParent ? { created_dirs: [parent] } : {}),
     };
   } finally {
-    await sftpUnlink(sftp, stagingPath);
+    try {
+      await sftpUnlink(sftp, stagingPath);
+    } finally {
+      sftp.end();
+    }
     await execCommand(
       conn,
       commandForElevation("rm -f -- " + quoteShell(targetStagingPath), elevate, context),
@@ -958,6 +839,8 @@ export async function prepareRemoteScript(
     } catch (error) {
       if (staged && sftp) await sftpUnlink(sftp, scriptPath);
       throw error;
+    } finally {
+      sftp?.end();
     }
   });
 }
