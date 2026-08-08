@@ -72,7 +72,7 @@ describe('Claude Code-style remote tools', () => {
     expect(wrapManagedRemoteCommand('echo hi')).toContain('managed_pid=$!');
     expect(wrapManagedRemoteCommand('echo hi')).toContain('exit $?');
     expect(wrapManagedRemoteCommand('echo hi', { usesStdin: true })).toContain('bash -c');
-    expect(wrapManagedRemoteCommand('echo hi')).toContain('kill -TERM -- -$$');
+    expect(wrapManagedRemoteCommand('echo hi')).toContain('kill -TERM -- "-$managed_pid"');
     expect(wrapManagedRemoteCommand('echo hi')).toContain('HUP');
 
     const managed = wrapManagedRemoteCommand('sleep 60', { jobId: 'job-test_1' });
