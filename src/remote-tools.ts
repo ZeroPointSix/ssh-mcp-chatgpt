@@ -192,6 +192,120 @@ async function withClient<T>(config: SSHConfig, callback: (conn: Client) => Prom
     throw new RemoteToolError("connect", "SSH connection failed");
   }
 }
+
+function execCommand(
+  conn: Client,
+  command: string,
+  stdin?: string,
+  timeoutMs = 60_000,
+): Promise<CommandResult> {
+  return new Promise((resolve, reject) => {
+    conn.exec(command, (error: Error | undefined, stream: ClientChannel) => {
+      if (error) {
+        reject(new RemoteToolError("exec", "Failed to start remote command"));
+        return;
+      }
+
+      const stdout: Buffer[] = [];
+      const stderr: Buffer[] = [];
+      let stdoutBytes = 0;
+      let stderrBytes = 0;
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        try {
+          stream.close();
+        } catch {
+          // Ignore close errors after timeout.
+        }
+        reject(new RemoteToolError("timeout", "Remote command exceeded timeout_ms"));
+      }, timeoutMs);
+      timer.unref?.();
+
+      const append = (chunks: Buffer[], chunk: Buffer, currentBytes: number): number => {
+        const nextBytes = currentBytes + chunk.length;
+        if (nextBytes > MAX_REMOTE_FILE_BYTES) {
+          throw new RemoteToolError("output", "Remote command output exceeded 8 MiB");
+        }
+        chunks.push(Buffer.from(chunk));
+        return nextBytes;
+      };
+
+      stream.on("data", (chunk: Buffer) => {
+        try {
+          stdoutBytes = append(stdout, chunk, stdoutBytes);
+        } catch (cause) {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            try {
+              stream.close();
+            } catch {
+              // Ignore close errors after output overflow.
+            }
+            reject(cause);
+          }
+        }
+      });
+      stream.stderr.on("data", (chunk: Buffer) => {
+        try {
+          stderrBytes = append(stderr, chunk, stderrBytes);
+        } catch (cause) {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            try {
+              stream.close();
+            } catch {
+              // Ignore close errors after output overflow.
+            }
+            reject(cause);
+          }
+        }
+      });
+      stream.on("error", () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(new RemoteToolError("exec", "Remote command channel failed"));
+      });
+      stream.on("close", (exitCode: number | null, signal: string | null) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({
+          exitCode,
+          signal,
+          stdout: Buffer.concat(stdout),
+          stderr: Buffer.concat(stderr),
+        });
+      });
+
+      if (stdin === undefined) stream.end();
+      else stream.end(stdin);
+    });
+  });
+}
+
+async function checkedCommand(
+  conn: Client,
+  command: string,
+  stage: string,
+  stdin?: string,
+  timeoutMs?: number,
+): Promise<CommandResult> {
+  const result = await execCommand(conn, command, stdin, timeoutMs);
+  if (result.exitCode !== 0 || result.signal) {
+    const detail = (result.stderr.length ? result.stderr : result.stdout).toString("utf8").trim();
+    throw new RemoteToolError(stage, detail || "Remote command failed", {
+      exit_code: result.exitCode,
+      signal: result.signal,
+    });
+  }
+  return result;
+}
+
 function openSftp(conn: Client): Promise<SFTPWrapper> {
   return new Promise((resolve, reject) => {
     conn.sftp((error, sftp) => {
