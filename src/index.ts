@@ -117,6 +117,7 @@ export interface SSHConfig {
   username: string;
   password?: string;
   privateKey?: string;
+  readyTimeout?: number;
   suPassword?: string;
   sudoPassword?: string;  // Password for sudo commands specifically (if different from suPassword)
 }

@@ -23,8 +23,14 @@ It keeps the existing stdio CLI for local MCP clients and adds a remote HTTP ent
 | `sudo-exec` | Executes a shell command through sudo when enabled globally and for the selected profile, with the same background job behavior. |
 | `exec-status` | Polls stdout, stderr, exit status, and progress for a background `job_id`. |
 | `exec-cancel` | Requests cancellation for a running background `job_id`; poll `exec-status` until the final status is confirmed. |
+| `fs-read` | Reads a remote text file with numbered lines, pagination, SHA-256, allowed-root checks, and an 8 MiB preflight limit. |
+| `fs-write` | Atomically writes text or Base64 content with conflict checks, backups, and preserved metadata for existing files. |
+| `fs-edit` | Replaces one exact match or all exact matches while preserving the existing file mode and ownership. |
+| `run-script` | Runs Bash, sh, Python, or Node scripts with syntax checks, arguments, environment values, stdin, timeouts, and cleanup. |
 
 SSH targets are intentionally server-side configuration. ChatGPT should not choose arbitrary hosts or receive raw credentials from a user prompt. Use `list-profiles` to discover configured profile IDs and pass `target_id` to `exec` or `sudo-exec`. If a default profile is configured, `target_id` may be omitted; otherwise the tool returns a clear missing-target error. Profiles are read-only at runtime and there are no profile CRUD tools.
+
+`exec` and `sudo-exec` accept one line. Use `run-script` for multiline scripts, heredocs, loops, and conditional logic. Use the file tools instead of shell redirection for file changes. Set `SSH_MCP_FS_ALLOWED_ROOTS` to a comma-separated list of absolute roots so file and script paths stay within approved directories.
 
 `exec` and `sudo-exec` return `status: "completed"` when the command finishes quickly. If the command is still running after `expire_time_ms`, they return `status: "running"` and a `job_id`; call `exec-status` with that ID until the job reaches `completed`, `failed`, `killed`, or `cancelled`. `exec-cancel` and `kill_time_ms` first move a job to `cancelling` or `kill_requested`; keep polling until the SSH channel confirms the final terminal status. Stderr is returned as command output and does not by itself make the tool fail; the remote exit code and signal determine the command status. Long-running stdout/stderr are retained as a bounded tail and report truncation metadata.
 
