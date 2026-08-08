@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { Client, type ClientChannel } from "ssh2";
 import type { SSHConfig } from "./index.js";
+import { acquireSshConnection, sshConnectionPool } from "./ssh-connection-pool.js";
 import {
   buildManagedRemoteCancelCommand,
   editRemoteFile,
@@ -146,6 +147,10 @@ interface CommandJob {
   stopConnection?: Client;
   stopStream?: ClientChannel;
   stopControlStarted?: boolean;
+  releaseConnection?: (unhealthy?: boolean) => void;
+  connectionUnhealthy?: boolean;
+  onConnectionError?: (error: Error) => void;
+  onConnectionClose?: () => void;
   cleanup?: () => Promise<void>;
   cleanupStarted?: boolean;
   cleanupError?: string;
@@ -940,10 +945,15 @@ function finishCommandJob(job: CommandJob, updates: Partial<CommandJob>): void {
   job.stopTimer = undefined;
   try { job.stream?.removeAllListeners(); } catch { /* ignore */ }
   try { job.stopStream?.removeAllListeners(); } catch { /* ignore */ }
-  try { job.conn?.end(); } catch { /* ignore */ }
+  if (job.conn && job.onConnectionError) job.conn.off("error", job.onConnectionError);
+  if (job.conn && job.onConnectionClose) job.conn.off("close", job.onConnectionClose);
+  job.releaseConnection?.(job.connectionUnhealthy);
   try { job.stopConnection?.end(); } catch { /* ignore */ }
   job.stream = undefined;
   job.conn = undefined;
+  job.releaseConnection = undefined;
+  job.onConnectionError = undefined;
+  job.onConnectionClose = undefined;
   job.stopStream = undefined;
   job.stopConnection = undefined;
   notifyCommandJobWaiters(job);
@@ -1092,7 +1102,7 @@ function requestStopCommandJob(job: CommandJob, status: CommandJobStopStatus, er
   return true;
 }
 
-function startSshCommandJob(
+async function startSshCommandJob(
   tool: CommandTool,
   target: ResolvedSshTarget,
   sshConfig: SSHConfig,
@@ -1104,8 +1114,10 @@ function startSshCommandJob(
   stdin?: string,
   cleanup?: () => Promise<void>,
   stopCommandFactory: (jobId: string) => string = buildManagedRemoteCancelCommand,
-): CommandJob {
-  const jobId = `job-${randomToken(12)}`;
+): Promise<CommandJob> {
+  const jobId = \`job-\${randomToken(12)}\`;
+  const lease = await acquireSshConnection(sshConfig);
+  const conn = lease.client;
   const job: CommandJob = {
     id: jobId,
     tool,
@@ -1127,11 +1139,10 @@ function startSshCommandJob(
     stopCommand: stopCommandFactory(jobId),
     cleanup,
     waiters: new Set(),
+    conn,
+    releaseConnection: lease.release,
   };
   commandJobs.set(job.id, job);
-
-  const conn = new Client();
-  job.conn = conn;
   const managedCommand = wrapManagedRemoteCommand(remoteCommand, {
     usesStdin: stdin !== undefined,
     jobId: job.id,
@@ -1139,50 +1150,17 @@ function startSshCommandJob(
 
   if (killTimeMs) {
     job.killTimer = setTimeout(() => {
-      requestStopCommandJob(job, "killed", `Command exceeded kill_time_ms (${killTimeMs}ms)`);
+      requestStopCommandJob(job, "killed", \`Command exceeded kill_time_ms (\${killTimeMs}ms)\`);
     }, killTimeMs);
     job.killTimer.unref?.();
   }
 
-  conn.on("ready", () => {
-    if (isTerminalJobStatus(job.status)) {
-      conn.end();
-      return;
-    }
-    job.startedAt = Date.now();
-    conn.exec(managedCommand, (err: Error | undefined, stream: ClientChannel) => {
-      if (err) {
-        failCommandJob(job, `SSH exec error: ${err.message}`);
-        return;
-      }
-
-      job.stream = stream;
-      if (job.stopRequestedStatus) startRemoteCommandStop(job);
-      stream.on("data", (data: Buffer) => {
-        appendCommandJobOutput(job, "stdout", data);
-      });
-      stream.stderr.on("data", (data: Buffer) => {
-        appendCommandJobOutput(job, "stderr", data);
-      });
-      if (stdin === undefined) stream.end();
-      else stream.end(stdin);
-      stream.on("close", (code: number | null, signal: string | null) => {
-        if (isTerminalJobStatus(job.status)) return;
-        job.exitCode = code;
-        job.signal = signal;
-        if (job.stopRequestedStatus) {
-          finalizeStoppedCommandJob(job);
-          return;
-        }
-        finishCommandJob(job, { status: "completed" });
-      });
-    });
-  });
-
-  conn.on("error", (err: Error) => {
-    failCommandJob(job, `SSH connection error: ${redactSshConnectionError(err.message)}`);
-  });
-  conn.on("close", () => {
+  job.onConnectionError = (err: Error) => {
+    job.connectionUnhealthy = true;
+    failCommandJob(job, \`SSH connection error: \${redactSshConnectionError(err.message)}\`);
+  };
+  job.onConnectionClose = () => {
+    job.connectionUnhealthy = true;
     if (isTerminalJobStatus(job.status)) return;
     if (job.stopRequestedStatus) {
       finalizeStoppedCommandJob(job);
@@ -1196,8 +1174,38 @@ function startSshCommandJob(
           : "SSH connection closed before the command started",
       );
     }
+  };
+  conn.on("error", job.onConnectionError);
+  conn.on("close", job.onConnectionClose);
+
+  job.startedAt = Date.now();
+  conn.exec(managedCommand, (err: Error | undefined, stream: ClientChannel) => {
+    if (err) {
+      failCommandJob(job, \`SSH exec error: \${err.message}\`);
+      return;
+    }
+    job.stream = stream;
+    if (job.stopRequestedStatus) startRemoteCommandStop(job);
+    stream.on("data", (data: Buffer) => {
+      appendCommandJobOutput(job, "stdout", data);
+    });
+    stream.stderr.on("data", (data: Buffer) => {
+      appendCommandJobOutput(job, "stderr", data);
+    });
+    if (stdin === undefined) stream.end();
+    else stream.end(stdin);
+    stream.on("close", (code: number | null, signal: string | null) => {
+      if (isTerminalJobStatus(job.status)) return;
+      job.exitCode = code;
+      job.signal = signal;
+      if (job.stopRequestedStatus) {
+        finalizeStoppedCommandJob(job);
+        return;
+      }
+      finishCommandJob(job, { status: "completed" });
+    });
   });
-  conn.connect(sshConfig);
+
   return job;
 }
 
@@ -1322,7 +1330,7 @@ async function runSshTool(name: "exec" | "sudo-exec", args: JsonObject, config: 
   }
 
   const sshConfig = await loadSshConfig(target);
-  const job = startSshCommandJob(
+  const job = await startSshCommandJob(
     name,
     target,
     sshConfig,
@@ -1417,7 +1425,7 @@ async function runScriptTool(args: JsonObject, config: RuntimeConfig, target: Re
   const expireTimeMs =
     parseDurationArg(args.expire_time_ms, config.execExpireTimeMs, "expire_time_ms") ??
     config.execExpireTimeMs;
-  const job = startSshCommandJob(
+  const job = await startSshCommandJob(
     "run-script",
     target,
     await loadSshConfig(target),
@@ -1916,6 +1924,7 @@ function healthPayload(config: RuntimeConfig): JsonObject {
     default_expire_time_ms: config.execExpireTimeMs,
     default_kill_time_ms: config.execKillTimeMs ?? "none",
     active_background_jobs: [...commandJobs.values()].filter((job) => isActiveJobStatus(job.status)).length,
+    ssh_connection_pool: sshConnectionPool.status(),
     ssh_target_configured: profiles.length > 0,
     ssh_profiles_configured: config.sshProfiles.length > 0,
     ssh_profile_count: profiles.length,
