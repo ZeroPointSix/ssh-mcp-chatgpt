@@ -1,7 +1,12 @@
 import { execFileSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
 import { invokeTool, listTools, loadRuntimeConfig } from '../src/chatgpt-http';
-import { remoteWorkspaceRoot, wrapManagedRemoteCommand, buildSyntaxCheckCommand } from '../src/remote-tools';
+import {
+  buildManagedRemoteCancelCommand,
+  buildSyntaxCheckCommand,
+  remoteWorkspaceRoot,
+  wrapManagedRemoteCommand,
+} from '../src/remote-tools';
 
 const originalEnv = { ...process.env };
 
@@ -62,11 +67,19 @@ describe('Claude Code-style remote tools', () => {
     expect(remoteWorkspaceRoot({ sshConfig: { username: 'deploy' } } as any, 'staging')).toBe(
       '/tmp/.mcp/users/deploy/staging',
     );
-    expect(wrapManagedRemoteCommand('echo hi')).toContain('bash -c');
+    expect(wrapManagedRemoteCommand('echo hi')).toContain('setsid bash -c');
     expect(wrapManagedRemoteCommand('echo hi')).toContain('exit $?');
     expect(wrapManagedRemoteCommand('echo hi', { usesStdin: true })).toContain('bash -c');
-    expect(wrapManagedRemoteCommand('echo hi')).toContain('kill -TERM 0');
-    expect(wrapManagedRemoteCommand('echo hi')).not.toContain('HUP');
+    expect(wrapManagedRemoteCommand('echo hi')).toContain('kill -TERM -- -$$');
+    expect(wrapManagedRemoteCommand('echo hi')).toContain('HUP');
+
+    const managed = wrapManagedRemoteCommand('sleep 60', { jobId: 'job-test_1' });
+    expect(managed).toContain('/tmp/.mcp/jobs/job-test_1.pid');
+    const cancel = buildManagedRemoteCancelCommand('job-test_1');
+    expect(cancel).toContain('/tmp/.mcp/jobs/job-test_1.pid');
+    expect(cancel).toContain('kill -TERM');
+    expect(cancel).toContain('kill -KILL');
+    expect(() => buildManagedRemoteCancelCommand('bad/job')).toThrow('Invalid managed job ID');
 
     const trailingSemicolon = wrapManagedRemoteCommand('printf ok;');
     expect(trailingSemicolon).not.toContain(';; exit $?');
