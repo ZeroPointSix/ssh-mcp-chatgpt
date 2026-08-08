@@ -43,7 +43,7 @@ describe('ChatGPT HTTP background command tools', () => {
     expect(health.default_output_max_chars).toBe(100000);
     expect(health.default_expire_time_ms).toBe(55000);
     expect(health.default_kill_time_ms).toBe(600000);
-    expect(health.version).toBe('1.6.3-chatgpt.0');
+    expect(health.version).toBe('1.6.4-chatgpt.0');
     expect(toolNames).toEqual(expect.arrayContaining(['exec', 'exec-status', 'exec-cancel']));
   });
 
