@@ -73,13 +73,26 @@ describe('Claude Code-style remote tools', () => {
     expect(wrapManagedRemoteCommand('echo hi')).toContain('kill -TERM -- -$$');
     expect(wrapManagedRemoteCommand('echo hi')).toContain('HUP');
 
-    const managed = wrapManagedRemoteCommand('sleep 60', { jobId: 'job-test_1' });
-    expect(managed).toContain('/tmp/.mcp/jobs/job-test_1.pid');
-    const cancel = buildManagedRemoteCancelCommand('job-test_1');
-    expect(cancel).toContain('/tmp/.mcp/jobs/job-test_1.pid');
+    const jobId = 'job-test_' + process.pid;
+    const pidPath = '/tmp/.mcp/jobs/' + jobId + '.pid';
+    const managed = wrapManagedRemoteCommand('sleep 60', { jobId });
+    expect(managed).toContain(pidPath);
+    const cancel = buildManagedRemoteCancelCommand(jobId);
+    expect(cancel).toContain(pidPath);
     expect(cancel).toContain('kill -TERM');
     expect(cancel).toContain('kill -KILL');
+    expect(cancel).toContain('kill -0');
     expect(() => buildManagedRemoteCancelCommand('bad/job')).toThrow('Invalid managed job ID');
+
+    const scenario = [
+      managed + ' &',
+      'wrapper_pid=$!',
+      "for attempt in 1 2 3 4 5 6 7 8 9 10; do [ -s '" + pidPath + "' ] && break; sleep 0.05; done",
+      cancel,
+      'wait "$wrapper_pid" || true',
+      "test ! -e '" + pidPath + "'",
+    ].join('\n');
+    expect(() => execFileSync('bash', ['-c', scenario], { timeout: 5000 })).not.toThrow();
 
     const trailingSemicolon = wrapManagedRemoteCommand('printf ok;');
     expect(trailingSemicolon).not.toContain(';; exit $?');
