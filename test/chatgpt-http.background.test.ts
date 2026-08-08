@@ -43,6 +43,7 @@ describe('ChatGPT HTTP background command tools', () => {
     expect(health.default_output_max_chars).toBe(100000);
     expect(health.default_expire_time_ms).toBe(55000);
     expect(health.default_kill_time_ms).toBe(600000);
+    expect(health.version).toBe('1.6.3-chatgpt.0');
     expect(toolNames).toEqual(expect.arrayContaining(['exec', 'exec-status', 'exec-cancel']));
   });
 
@@ -176,6 +177,14 @@ describe('ChatGPT HTTP background command tools', () => {
 
     expect(['cancelling', 'cancelled']).toContain(cancelled.status);
     expect(cancelled.stop_requested_status).toBe('cancelled');
+    const repeated = await invokeTool(
+      'exec-cancel',
+      { job_id: started.job_id, note: 'repeat cancellation request' },
+      'test-session',
+      config,
+    );
+    expect(repeated.stop_requested_at).toBe(cancelled.stop_requested_at);
+    expect(repeated.stop_requested_status).toBe('cancelled');
     if (cancelled.status === 'cancelling') {
       expect(cancelled.completed_at).toBeUndefined();
       expect(cancelled.next_action).toContain('exec-status');
@@ -189,6 +198,15 @@ describe('ChatGPT HTTP background command tools', () => {
 
     expect(['cancelled', 'killed']).toContain(current.status);
     expect(current.completed_at).toBeDefined();
+
+    const afterTerminal = await invokeTool(
+      'exec-cancel',
+      { job_id: started.job_id, note: 'repeat cancellation after completion' },
+      'test-session',
+      config,
+    );
+    expect(afterTerminal.status).toBe(current.status);
+    expect(afterTerminal.completed_at).toBe(current.completed_at);
   }, 10000);
 
   it('stops background child processes after cancellation', async () => {
