@@ -138,6 +138,9 @@ interface CommandJob {
   conn?: Client;
   stream?: ClientChannel;
   killTimer?: NodeJS.Timeout;
+  cleanup?: () => Promise<void>;
+  cleanupStarted?: boolean;
+  cleanupError?: string;
   waiters: Set<() => void>;
 }
 
@@ -900,6 +903,7 @@ function commandJobPayload(job: CommandJob): JsonObject {
   if (job.stopRequestedStatus) payload.stop_requested_status = job.stopRequestedStatus;
   if (job.stopSignalSent !== undefined) payload.stop_signal_sent = job.stopSignalSent;
   if (job.stopError) payload.stop_error = job.stopError;
+  if (job.cleanupError) payload.cleanup_error = job.cleanupError;
   if (completedAt) payload.completed_at = new Date(completedAt).toISOString();
   if (job.exitCode !== undefined) payload.exit_code = job.exitCode;
   if (job.signal !== undefined) payload.signal = job.signal;
@@ -916,6 +920,12 @@ function commandJobPayload(job: CommandJob): JsonObject {
 function finishCommandJob(job: CommandJob, updates: Partial<CommandJob>): void {
   if (isTerminalJobStatus(job.status)) return;
   Object.assign(job, updates, { completedAt: Date.now() });
+  if (job.cleanup && !job.cleanupStarted) {
+    job.cleanupStarted = true;
+    void job.cleanup().catch((error) => {
+      job.cleanupError = error instanceof Error ? error.message : "Remote script cleanup failed";
+    });
+  }
   if (job.killTimer) clearTimeout(job.killTimer);
   job.killTimer = undefined;
   try { job.stream?.removeAllListeners(); } catch { /* ignore */ }
@@ -992,6 +1002,7 @@ function startSshCommandJob(
   outputMaxChars: number,
   killTimeMs?: number,
   stdin?: string,
+  cleanup?: () => Promise<void>,
 ): CommandJob {
   const job: CommandJob = {
     id: `job-${randomToken(12)}`,
@@ -1010,6 +1021,7 @@ function startSshCommandJob(
     stderrChars: 0,
     stdoutTruncated: false,
     stderrTruncated: false,
+    cleanup,
     waiters: new Set(),
   };
   commandJobs.set(job.id, job);
@@ -1295,6 +1307,7 @@ async function runScriptTool(args: JsonObject, config: RuntimeConfig, target: Re
     config.execOutputMaxChars,
     prepared.timeoutMs,
     prepared.stdin,
+    prepared.cleanup,
   );
   await waitForCommandJob(job, expireTimeMs);
   return commandJobPayload(job);
@@ -1329,7 +1342,7 @@ function redactArgs(args: JsonObject): JsonObject {
     if (lower.includes("password") || lower.includes("token") || lower.includes("key")) {
       redacted[key] = "[redacted]";
     } else if (
-      ["command", "content", "content_base64", "old_string", "new_string", "stdin", "env"].includes(key)
+      ["command", "content", "content_base64", "old_string", "new_string", "stdin", "env", "args"].includes(key)
     ) {
       const size = typeof value === "string" ? value.length : JSON.stringify(value).length;
       redacted[key] = "[redacted " + key + ", " + size + " chars]";
