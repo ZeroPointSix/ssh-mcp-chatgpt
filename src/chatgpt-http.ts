@@ -9,7 +9,9 @@ import { pathToFileURL } from "node:url";
 import { Client, type ClientChannel } from "ssh2";
 import type { SSHConfig } from "./index.js";
 import {
+  cancelManagedRemoteCommand,
   editRemoteFile,
+  managedRemoteCommandControlPath,
   prepareRemoteScript,
   readRemoteFile,
   RemoteToolError,
@@ -23,7 +25,7 @@ type JsonRpcId = string | number | null;
 type JsonObject = Record<string, unknown>;
 
 const SERVER_NAME = "ssh-mcp-chatgpt";
-const SERVER_VERSION = "1.6.1-chatgpt.0";
+const SERVER_VERSION = "1.6.3-chatgpt.0";
 const STREAMABLE_HTTP_ACCEPT = "application/json, text/event-stream";
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const CODE_TTL_MS = 5 * 60 * 1000;
@@ -135,6 +137,8 @@ interface CommandJob {
   stopReason?: string;
   stopSignalSent?: boolean;
   stopError?: string;
+  stop?: () => Promise<void>;
+  stopStarted?: boolean;
   conn?: Client;
   stream?: ClientChannel;
   killTimer?: NodeJS.Timeout;
@@ -967,27 +971,60 @@ function requestStopCommandJob(job: CommandJob, status: CommandJobStopStatus, er
   job.stopRequestedAt ??= Date.now();
   job.stopReason = error;
 
-  let signalSent = false;
-  let stopError: string | undefined;
-  const stream = job.stream as (ClientChannel & { signal?: (signalName: string) => void }) | undefined;
-  try {
-    stream?.signal?.("TERM");
-    signalSent = Boolean(stream);
-    stream?.signal?.("KILL");
-  } catch (err) {
-    stopError = err instanceof Error ? err.message : "Failed to send SSH kill signal";
+  if (job.stopStarted) {
+    notifyCommandJobWaiters(job);
+    return true;
   }
-  try { stream?.close(); } catch (err) {
-    stopError = err instanceof Error ? err.message : "Failed to close SSH channel";
-  }
-  if (!stream) {
-    try { job.conn?.end(); } catch (err) {
-      stopError = err instanceof Error ? err.message : "Failed to close SSH connection";
+  job.stopStarted = true;
+
+  if (!job.stop) {
+    let signalSent = false;
+    let stopError: string | undefined;
+    const stream = job.stream as (ClientChannel & { signal?: (signalName: string) => void }) | undefined;
+    try {
+      stream?.signal?.("TERM");
+      signalSent = Boolean(stream);
+      stream?.signal?.("KILL");
+    } catch (err) {
+      stopError = err instanceof Error ? err.message : "Failed to send SSH kill signal";
     }
+    try { stream?.close(); } catch (err) {
+      stopError = err instanceof Error ? err.message : "Failed to close SSH channel";
+    }
+    if (!stream) {
+      try { job.conn?.end(); } catch (err) {
+        stopError = err instanceof Error ? err.message : "Failed to close SSH connection";
+      }
+    }
+    job.stopSignalSent = signalSent;
+    if (stopError) job.stopError = stopError;
+    notifyCommandJobWaiters(job);
+    return true;
   }
 
-  job.stopSignalSent = signalSent;
-  if (stopError) job.stopError = stopError;
+  void job.stop()
+    .then(() => {
+      if (isTerminalJobStatus(job.status)) return;
+      job.stopSignalSent = true;
+      finalizeStoppedCommandJob(job);
+    })
+    .catch((cause) => {
+      if (isTerminalJobStatus(job.status)) return;
+      const detail = cause instanceof Error ? cause.message : "Remote cancellation failed";
+      job.stopError = detail;
+      const stream = job.stream as (ClientChannel & { signal?: (signalName: string) => void }) | undefined;
+      try {
+        stream?.signal?.("TERM");
+        stream?.signal?.("KILL");
+        job.stopSignalSent = Boolean(stream);
+      } catch {
+        // The confirmed remote cancellation error is the actionable failure.
+      }
+      try { stream?.close(); } catch { /* ignore */ }
+      try { job.conn?.end(); } catch { /* ignore */ }
+      finishCommandJob(job, { status: "failed", error: "Cancellation failed: " + detail });
+    });
+
   notifyCommandJobWaiters(job);
   return true;
 }
@@ -1004,8 +1041,10 @@ function startSshCommandJob(
   stdin?: string,
   cleanup?: () => Promise<void>,
 ): CommandJob {
+  const jobId = `job-${randomToken(12)}`;
+  const controlPath = managedRemoteCommandControlPath(sshConfig.username, jobId);
   const job: CommandJob = {
-    id: `job-${randomToken(12)}`,
+    id: jobId,
     tool,
     targetId: target.id,
     targetLabel: target.label,
@@ -1022,13 +1061,17 @@ function startSshCommandJob(
     stdoutTruncated: false,
     stderrTruncated: false,
     cleanup,
+    stop: () => cancelManagedRemoteCommand(sshConfig, controlPath),
     waiters: new Set(),
   };
   commandJobs.set(job.id, job);
 
   const conn = new Client();
   job.conn = conn;
-  const managedCommand = wrapManagedRemoteCommand(remoteCommand, { usesStdin: stdin !== undefined });
+  const managedCommand = wrapManagedRemoteCommand(remoteCommand, {
+    usesStdin: stdin !== undefined,
+    controlPath,
+  });
 
   if (killTimeMs) {
     job.killTimer = setTimeout(() => {
@@ -1059,7 +1102,7 @@ function startSshCommandJob(
         job.exitCode = code;
         job.signal = signal;
         if (job.stopRequestedStatus) {
-          finalizeStoppedCommandJob(job);
+          if (!job.stop) finalizeStoppedCommandJob(job);
           return;
         }
         finishCommandJob(job, { status: "completed" });
@@ -1073,7 +1116,7 @@ function startSshCommandJob(
   conn.on("close", () => {
     if (isTerminalJobStatus(job.status)) return;
     if (job.stopRequestedStatus) {
-      finalizeStoppedCommandJob(job);
+      if (!job.stop) finalizeStoppedCommandJob(job);
       return;
     }
     if (job.status === "running") {
