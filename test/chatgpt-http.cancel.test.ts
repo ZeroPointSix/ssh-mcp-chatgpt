@@ -1,4 +1,3 @@
-import { EventEmitter } from 'node:events';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { invokeTool, loadRuntimeConfig } from '../src/chatgpt-http';
 
@@ -6,7 +5,9 @@ const mockState = vi.hoisted(() => ({
   commands: [] as string[],
 }));
 
-vi.mock('ssh2', () => {
+vi.mock('ssh2', async () => {
+  const { EventEmitter } = await import('node:events');
+
   class Client extends EventEmitter {
     connect() {
       queueMicrotask(() => this.emit('ready'));
@@ -97,7 +98,7 @@ describe('exec-cancel remote process-group control', () => {
     expect(repeated.stop_requested_at).toBe(terminal.stop_requested_at);
 
     expect(mockState.commands).toHaveLength(2);
-    expect(mockState.commands[0]).toContain('setsid bash -c');
+    expect(mockState.commands[0]).toContain('setsid --wait bash -c');
     expect(mockState.commands[0]).toContain(started.job_id + '.pid');
     expect(mockState.commands[1]).toContain(started.job_id + '.pid');
     expect(mockState.commands[1]).toContain('kill -TERM');
