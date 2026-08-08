@@ -24,7 +24,7 @@ type JsonRpcId = string | number | null;
 type JsonObject = Record<string, unknown>;
 
 const SERVER_NAME = "ssh-mcp-chatgpt";
-const SERVER_VERSION = "1.6.3-chatgpt.0";
+const SERVER_VERSION = "1.6.4-chatgpt.0";
 const STREAMABLE_HTTP_ACCEPT = "application/json, text/event-stream";
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const CODE_TTL_MS = 5 * 60 * 1000;
