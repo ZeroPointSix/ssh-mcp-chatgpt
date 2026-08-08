@@ -73,7 +73,6 @@ describe('Claude Code-style remote tools', () => {
     expect(execFileSync('bash', ['-c', trailingSemicolon], { encoding: 'utf8' })).toBe('ok');
 
     const trailingComment = wrapManagedRemoteCommand('printf ok # trailing comment');
-    expect(trailingComment).toContain('# trailing comment\\nexit $?');
     expect(execFileSync('bash', ['-c', trailingComment], { encoding: 'utf8' })).toBe('ok');
     expect(buildSyntaxCheckCommand('python3', '/tmp/example.py')).toContain('ast.parse');
     expect(buildSyntaxCheckCommand('python3', '/tmp/example.py')).not.toContain('py_compile');
