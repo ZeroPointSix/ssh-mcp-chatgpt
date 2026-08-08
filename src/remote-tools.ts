@@ -118,7 +118,7 @@ export function wrapManagedRemoteCommand(
     "trap 'trap \"\" TERM; kill -TERM -- -$$ 2>/dev/null || true; trap - TERM INT HUP; exit 143' TERM INT HUP; " +
     command +
     "\nexit $?";
-  return "setsid bash -c " + quoteShell(inner);
+  return "setsid --wait bash -c " + quoteShell(inner);
 }
 
 export function buildManagedRemoteCancelCommand(jobId: string): string {
