@@ -1,7 +1,13 @@
 import { execFileSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
 import { invokeTool, listTools, loadRuntimeConfig } from '../src/chatgpt-http';
-import { remoteWorkspaceRoot, wrapManagedRemoteCommand, buildSyntaxCheckCommand } from '../src/remote-tools';
+import {
+  buildManagedRemoteCancelCommand,
+  buildSyntaxCheckCommand,
+  managedRemoteCommandControlPath,
+  remoteWorkspaceRoot,
+  wrapManagedRemoteCommand,
+} from '../src/remote-tools';
 
 const originalEnv = { ...process.env };
 
@@ -58,15 +64,30 @@ describe('Claude Code-style remote tools', () => {
     ]);
   });
 
-  it('scopes staging paths per ssh user and wraps managed commands', () => {
+  it('scopes paths and stops an isolated managed process group', () => {
     expect(remoteWorkspaceRoot({ sshConfig: { username: 'deploy' } } as any, 'staging')).toBe(
       '/tmp/.mcp/users/deploy/staging',
     );
-    expect(wrapManagedRemoteCommand('echo hi')).toContain('bash -c');
-    expect(wrapManagedRemoteCommand('echo hi')).toContain('exit $?');
-    expect(wrapManagedRemoteCommand('echo hi', { usesStdin: true })).toContain('bash -c');
-    expect(wrapManagedRemoteCommand('echo hi')).toContain('kill -TERM 0');
-    expect(wrapManagedRemoteCommand('echo hi')).not.toContain('HUP');
+    const controlPath = managedRemoteCommandControlPath('deploy', 'job-test-' + process.pid);
+    expect(controlPath).toBe('/tmp/.mcp/users/deploy/jobs/job-test-' + process.pid + '.pid');
+
+    const managed = wrapManagedRemoteCommand('while true; do sleep 1; done', { controlPath });
+    const cancel = buildManagedRemoteCancelCommand(controlPath);
+    expect(managed).toContain('setsid bash -c');
+    expect(managed).toContain(controlPath);
+    expect(managed).toContain('wait "$managed_pid"');
+    expect(cancel).toContain('kill -TERM -- "-$managed_pid"');
+    expect(cancel).toContain('kill -KILL -- "-$managed_pid"');
+
+    const scenario = [
+      managed + ' &',
+      'wrapper_pid=$!',
+      "for attempt in 1 2 3 4 5 6 7 8 9 10; do [ -s '" + controlPath + "' ] && break; sleep 0.05; done",
+      cancel,
+      'wait "$wrapper_pid" || true',
+      "test ! -e '" + controlPath + "'",
+    ].join('\n');
+    expect(() => execFileSync('bash', ['-c', scenario], { timeout: 5000 })).not.toThrow();
 
     const trailingSemicolon = wrapManagedRemoteCommand('printf ok;');
     expect(trailingSemicolon).not.toContain(';; exit $?');
