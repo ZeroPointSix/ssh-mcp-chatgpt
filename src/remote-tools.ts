@@ -109,16 +109,21 @@ export function wrapManagedRemoteCommand(
   const pidPath = options.jobId ? managedJobPidPath(options.jobId) : undefined;
   const setup = pidPath
     ? "pid_file=" + quoteShell(pidPath) +
-      "; umask 077; mkdir -p " + quoteShell(MANAGED_JOB_ROOT) +
-      "; printf '%s\\n' \"$$\" > \"$pid_file\"" +
-      "; trap 'rm -f -- \"$pid_file\"' EXIT; "
-    : "";
+      "; umask 077; mkdir -p " + quoteShell(MANAGED_JOB_ROOT) + "; "
+    : "pid_file=''; ";
+  const publishPid = pidPath ? "printf '%s\\n' \"$managed_pid\" > \"$pid_file\"\n" : "";
   const inner =
     setup +
-    "trap 'trap \"\" TERM; kill -TERM -- -$$ 2>/dev/null || true; trap - TERM INT HUP; exit 143' TERM INT HUP; " +
+    "managed_pid=''; " +
+    "terminate() { trap - TERM INT HUP; if [ -n \"$managed_pid\" ]; then kill -TERM -- \"-$managed_pid\" 2>/dev/null || true; fi; exit 143; }; " +
+    "cleanup() { if [ -n \"$pid_file\" ]; then rm -f -- \"$pid_file\"; fi; }; " +
+    "trap terminate TERM INT HUP; trap cleanup EXIT; set -m; (\n" +
     command +
+    "\n) &\nmanaged_pid=$!\nset +m\n" +
+    publishPid +
+    "wait \"$managed_pid\"" +
     "\nexit $?";
-  return "setsid -w bash -c " + quoteShell(inner);
+  return "bash -c " + quoteShell(inner);
 }
 
 export function buildManagedRemoteCancelCommand(jobId: string): string {
