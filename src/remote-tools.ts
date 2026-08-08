@@ -96,7 +96,7 @@ export function wrapManagedRemoteCommand(command: string, options: { usesStdin?:
   const inner =
     "trap 'kill -TERM 0 2>/dev/null; kill -KILL 0 2>/dev/null; exit 143' TERM INT; " +
     command +
-    "; exit $?";
+    "\nexit $?";
   return "bash -c " + quoteShell(inner);
 }
 

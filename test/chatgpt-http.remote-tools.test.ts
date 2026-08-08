@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
 import { invokeTool, listTools, loadRuntimeConfig } from '../src/chatgpt-http';
 import { remoteWorkspaceRoot, wrapManagedRemoteCommand, buildSyntaxCheckCommand } from '../src/remote-tools';
@@ -66,6 +67,14 @@ describe('Claude Code-style remote tools', () => {
     expect(wrapManagedRemoteCommand('echo hi', { usesStdin: true })).toContain('bash -c');
     expect(wrapManagedRemoteCommand('echo hi')).toContain('kill -TERM 0');
     expect(wrapManagedRemoteCommand('echo hi')).not.toContain('HUP');
+
+    const trailingSemicolon = wrapManagedRemoteCommand('printf ok;');
+    expect(trailingSemicolon).not.toContain(';; exit $?');
+    expect(execFileSync('bash', ['-c', trailingSemicolon], { encoding: 'utf8' })).toBe('ok');
+
+    const trailingComment = wrapManagedRemoteCommand('printf ok # trailing comment');
+    expect(trailingComment).toContain('# trailing comment\\nexit $?');
+    expect(execFileSync('bash', ['-c', trailingComment], { encoding: 'utf8' })).toBe('ok');
     expect(buildSyntaxCheckCommand('python3', '/tmp/example.py')).toContain('ast.parse');
     expect(buildSyntaxCheckCommand('python3', '/tmp/example.py')).not.toContain('py_compile');
   });
