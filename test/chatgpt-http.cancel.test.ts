@@ -98,7 +98,7 @@ describe('exec-cancel remote process-group control', () => {
     expect(repeated.stop_requested_at).toBe(terminal.stop_requested_at);
 
     expect(mockState.commands).toHaveLength(2);
-    expect(mockState.commands[0]).toContain('setsid --wait bash -c');
+    expect(mockState.commands[0]).toContain('setsid -w bash -c');
     expect(mockState.commands[0]).toContain(started.job_id + '.pid');
     expect(mockState.commands[1]).toContain(started.job_id + '.pid');
     expect(mockState.commands[1]).toContain('kill -TERM');
