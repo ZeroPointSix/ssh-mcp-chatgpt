@@ -67,7 +67,7 @@ describe('Claude Code-style remote tools', () => {
     expect(remoteWorkspaceRoot({ sshConfig: { username: 'deploy' } } as any, 'staging')).toBe(
       '/tmp/.mcp/users/deploy/staging',
     );
-    expect(wrapManagedRemoteCommand('echo hi')).toContain('setsid --wait bash -c');
+    expect(wrapManagedRemoteCommand('echo hi')).toContain('setsid -w bash -c');
     expect(wrapManagedRemoteCommand('echo hi')).toContain('exit $?');
     expect(wrapManagedRemoteCommand('echo hi', { usesStdin: true })).toContain('bash -c');
     expect(wrapManagedRemoteCommand('echo hi')).toContain('kill -TERM -- -$$');
