@@ -272,7 +272,17 @@ describe('ChatGPT HTTP SSH profiles', () => {
     process.env.SSH_MCP_TOOL_CALL_LOG_ENABLED = '1';
     const config = loadRuntimeConfig();
 
-    await invokeTool('exec', { command: 'echo secret', expire_time_ms: 1000, note: 'audit default target' }, 'session-a', config);
+    await invokeTool(
+      'exec',
+      {
+        command: 'echo secret',
+        args: ['sensitive-token'],
+        expire_time_ms: 1000,
+        note: 'audit default target',
+      },
+      'session-a',
+      config,
+    );
 
     const logDate = new Date().toISOString().slice(0, 10);
     const log = await readFile(join(dir, 'tool-calls', `${logDate}.jsonl`), 'utf8');
@@ -280,7 +290,9 @@ describe('ChatGPT HTTP SSH profiles', () => {
     expect(record.arguments.target_id).toBe('dev');
     expect(record.arguments.target_label).toBe('Development VPS');
     expect(record.arguments.command).toBe('[redacted command, 11 chars]');
+    expect(record.arguments.args).toMatch(/^\[redacted args,/);
     expect(JSON.stringify(record)).not.toContain('dev-secret');
     expect(JSON.stringify(record)).not.toContain('echo secret');
+    expect(JSON.stringify(record)).not.toContain('sensitive-token');
   });
 });
