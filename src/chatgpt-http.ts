@@ -8,7 +8,11 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { Client, type ClientChannel } from "ssh2";
 import type { SSHConfig } from "./index.js";
-import { acquireSshConnection, sshConnectionPool } from "./ssh-connection-pool.js";
+import {
+  acquireSshConnection,
+  sshConnectionPool,
+  type SshConnectionLease,
+} from "./ssh-connection-pool.js";
 import {
   buildManagedRemoteCancelCommand,
   editRemoteFile,
@@ -25,7 +29,7 @@ type JsonRpcId = string | number | null;
 type JsonObject = Record<string, unknown>;
 
 const SERVER_NAME = "ssh-mcp-chatgpt";
-const SERVER_VERSION = "1.6.6-chatgpt.0";
+const SERVER_VERSION = "1.6.7-chatgpt.0";
 const STREAMABLE_HTTP_ACCEPT = "application/json, text/event-stream";
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const CODE_TTL_MS = 5 * 60 * 1000;
@@ -1115,9 +1119,7 @@ async function startSshCommandJob(
   cleanup?: () => Promise<void>,
   stopCommandFactory: (jobId: string) => string = buildManagedRemoteCancelCommand,
 ): Promise<CommandJob> {
-  const jobId = \`job-\${randomToken(12)}\`;
-  const lease = await acquireSshConnection(sshConfig);
-  const conn = lease.client;
+  const jobId = `job-${randomToken(12)}`;
   const job: CommandJob = {
     id: jobId,
     tool,
@@ -1139,10 +1141,24 @@ async function startSshCommandJob(
     stopCommand: stopCommandFactory(jobId),
     cleanup,
     waiters: new Set(),
-    conn,
-    releaseConnection: lease.release,
   };
   commandJobs.set(job.id, job);
+
+  let lease: SshConnectionLease;
+  try {
+    lease = await acquireSshConnection(sshConfig);
+  } catch (error) {
+    const detail =
+      error instanceof Error
+        ? redactSshConnectionError(error.message)
+        : "Unknown SSH connection failure";
+    failCommandJob(job, `SSH connection error: ${detail}`);
+    return job;
+  }
+
+  const conn = lease.client;
+  job.conn = conn;
+  job.releaseConnection = lease.release;
   const managedCommand = wrapManagedRemoteCommand(remoteCommand, {
     usesStdin: stdin !== undefined,
     jobId: job.id,
@@ -1150,14 +1166,14 @@ async function startSshCommandJob(
 
   if (killTimeMs) {
     job.killTimer = setTimeout(() => {
-      requestStopCommandJob(job, "killed", \`Command exceeded kill_time_ms (\${killTimeMs}ms)\`);
+      requestStopCommandJob(job, "killed", `Command exceeded kill_time_ms (${killTimeMs}ms)`);
     }, killTimeMs);
     job.killTimer.unref?.();
   }
 
   job.onConnectionError = (err: Error) => {
     job.connectionUnhealthy = true;
-    failCommandJob(job, \`SSH connection error: \${redactSshConnectionError(err.message)}\`);
+    failCommandJob(job, `SSH connection error: ${redactSshConnectionError(err.message)}`);
   };
   job.onConnectionClose = () => {
     job.connectionUnhealthy = true;
@@ -1181,7 +1197,10 @@ async function startSshCommandJob(
   job.startedAt = Date.now();
   conn.exec(managedCommand, (err: Error | undefined, stream: ClientChannel) => {
     if (err) {
-      failCommandJob(job, \`SSH exec error: \${err.message}\`);
+      failCommandJob(
+        job,
+        `SSH exec error: ${redactSshConnectionError(err.message)}`,
+      );
       return;
     }
     job.stream = stream;
@@ -2419,3 +2438,4 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
 }
 
 export { loadRuntimeConfig, listTools, healthPayload, invokeTool };
+
