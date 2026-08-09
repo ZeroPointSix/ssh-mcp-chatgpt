@@ -225,7 +225,7 @@ export class SshConnectionPool {
       timer = setTimeout(() => {
         waiters.delete(wake);
         if (waiters.size === 0) this.waiters.delete(key);
-        reject(new Error(\`SSH connection pool acquire timed out after \${this.acquireTimeoutMs}ms\`));
+        reject(new Error(`SSH connection pool acquire timed out after ${this.acquireTimeoutMs}ms`));
       }, this.acquireTimeoutMs);
       timer.unref?.();
     });
