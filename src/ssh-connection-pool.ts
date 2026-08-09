@@ -200,6 +200,10 @@ export class SshConnectionPool {
       });
       client.on("close", () => {
         entry.dead = true;
+        if (!settled) {
+          settled = true;
+          reject(new Error("SSH connection closed before ready"));
+        }
         this.wakeOne(key);
       });
       client.connect(config);
