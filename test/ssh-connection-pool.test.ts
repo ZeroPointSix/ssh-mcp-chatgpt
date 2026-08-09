@@ -111,6 +111,36 @@ describe("SshConnectionPool", () => {
     pool.closeAll();
   });
 
+
+  it("times out while waiting for channel capacity", async () => {
+    const clients: FakeClient[] = [];
+    const pool = new SshConnectionPool(1, 1, 20, 60_000, fakeFactory(clients));
+
+    const first = await pool.acquire(config);
+    await expect(pool.acquire(config)).rejects.toThrow(
+      "SSH connection pool acquire timed out after 20ms",
+    );
+
+    first.release();
+    pool.closeAll();
+  });
+
+  it("reclaims an expired idle connection", async () => {
+    const clients: FakeClient[] = [];
+    const pool = new SshConnectionPool(1, 1, 1_000, 10, fakeFactory(clients));
+
+    const lease = await pool.acquire(config);
+    lease.release();
+    (pool as any).closeExpiredIdleConnections(Date.now() + 11);
+
+    expect(clients[0].ended).toBe(true);
+    expect(pool.status()).toMatchObject({
+      connections: 0,
+      idle_connections: 0,
+    });
+    pool.closeAll();
+  });
+
   it("rejects when the transport closes before SSH is ready", async () => {
     const clients: FakeClient[] = [];
     const pool = new SshConnectionPool(
