@@ -356,9 +356,28 @@ function sftpWriteFile(sftp: SFTPWrapper, path: string, content: Buffer): Promis
   });
 }
 
-function sftpUnlink(sftp: SFTPWrapper, path: string): Promise<void> {
+type ClosableSftp = SFTPWrapper & { outgoing?: { state?: string } };
+
+function closeSftp(sftp: SFTPWrapper): Promise<void> {
+  const channel = sftp as ClosableSftp;
+  if (channel.outgoing?.state === "closed") return Promise.resolve();
+
   return new Promise((resolve) => {
-    sftp.unlink(path, () => resolve());
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      sftp.removeListener("close", finish);
+      resolve();
+    };
+    sftp.once("close", finish);
+    try {
+      sftp.end();
+    } catch {
+      finish();
+      return;
+    }
+    if (channel.outgoing?.state === "closed") finish();
   });
 }
 
@@ -424,7 +443,7 @@ async function readBuffer(
     }
     return await sftpReadFile(sftp, path);
   } finally {
-    sftp.end();
+    await closeSftp(sftp);
   }
 }
 
@@ -444,7 +463,7 @@ async function remoteFileMetadata(
         gid: attrs.gid,
       };
     } finally {
-      sftp.end();
+      await closeSftp(sftp);
     }
   }
   const result = await checkedCommand(
@@ -628,13 +647,18 @@ async function writeBuffer(
     parent,
     "." + pathPosix.basename(targetPath) + ".mcp-" + randomUUID(),
   );
-  const sftp = await openSftp(conn);
-  await sftpWriteFile(sftp, stagingPath, buffer);
-
   const backupEnabled = options.backup !== false;
   const timestamp = new Date().toISOString().replace(/\D/g, "").slice(0, 14);
   const backupPath = targetPath + ".bak." + timestamp;
   try {
+    const sftp = await openSftp(conn);
+    try {
+      await sftpWriteFile(sftp, stagingPath, buffer);
+    } finally {
+      // One pool lease must hold no more than one SSH session at a time.
+      await closeSftp(sftp);
+    }
+
     if (currentHash && backupEnabled) {
       await checkedCommand(
         conn,
@@ -682,14 +706,16 @@ async function writeBuffer(
       ...(createdParent ? { created_dirs: [parent] } : {}),
     };
   } finally {
-    try {
-      await sftpUnlink(sftp, stagingPath);
-    } finally {
-      sftp.end();
-    }
     await execCommand(
       conn,
-      commandForElevation("rm -f -- " + quoteShell(targetStagingPath), elevate, context),
+      commandForElevation(
+        "rm -f -- " +
+          quoteShell(stagingPath) +
+          " " +
+          quoteShell(targetStagingPath),
+        elevate,
+        context,
+      ),
     ).catch(() => undefined);
   }
 }
@@ -880,25 +906,28 @@ export async function prepareRemoteScript(
     const elevate = options.elevate === true;
     let scriptPath: string;
     let staged = false;
-    let sftp: SFTPWrapper | undefined;
-
-    if (hasContent) {
-      const normalized = (options.content ?? "").replace(/\r\n/g, "\n");
-      const buffer = Buffer.from(normalized, "utf8");
-      if (buffer.length > MAX_REMOTE_FILE_BYTES) {
-        throw new RemoteToolError("input", "Script content exceeds 8 MiB");
-      }
-      await ensureStagingDirectory(conn, remoteWorkspaceRoot(context, "scripts"), elevate, context);
-      const extension = interpreter === "python3" ? ".py" : interpreter === "node" ? ".js" : ".sh";
-      scriptPath = remoteWorkspaceRoot(context, "scripts") + "/" + randomUUID() + extension;
-      sftp = await openSftp(conn);
-      await sftpWriteFile(sftp, scriptPath, buffer);
-      staged = true;
-    } else {
-      scriptPath = await canonicalizePath(conn, options.path ?? "", context);
-    }
 
     try {
+      if (hasContent) {
+        const normalized = (options.content ?? "").replace(/\r\n/g, "\n");
+        const buffer = Buffer.from(normalized, "utf8");
+        if (buffer.length > MAX_REMOTE_FILE_BYTES) {
+          throw new RemoteToolError("input", "Script content exceeds 8 MiB");
+        }
+        await ensureStagingDirectory(conn, remoteWorkspaceRoot(context, "scripts"), elevate, context);
+        const extension = interpreter === "python3" ? ".py" : interpreter === "node" ? ".js" : ".sh";
+        scriptPath = remoteWorkspaceRoot(context, "scripts") + "/" + randomUUID() + extension;
+        const sftp = await openSftp(conn);
+        staged = true;
+        try {
+          await sftpWriteFile(sftp, scriptPath, buffer);
+        } finally {
+          await closeSftp(sftp);
+        }
+      } else {
+        scriptPath = await canonicalizePath(conn, options.path ?? "", context);
+      }
+
       if (options.checkSyntax !== false) {
         const syntax = await execCommand(
           conn,
@@ -951,10 +980,14 @@ export async function prepareRemoteScript(
           : undefined,
       };
     } catch (error) {
-      if (staged && sftp) await sftpUnlink(sftp, scriptPath);
+      if (staged) {
+        await execCommand(
+          conn,
+          commandForElevation("rm -f -- " + quoteShell(scriptPath), elevate, context),
+        ).catch(() => undefined);
+      }
       throw error;
-    } finally {
-      sftp?.end();
     }
   });
 }
+
