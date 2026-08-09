@@ -172,6 +172,8 @@ Example MCP client config:
 | `SSH_MCP_TOOL_CALL_LOG_ENABLED` | Set `0` to disable audit logging. |
 | `SSH_MCP_TOOL_CALL_NOTE_REQUIRED` | Set `1` to require `note` on tool calls. |
 
+Pool capacity counts operation leases. File workflows wait for an SFTP channel to close before they open an exec channel. One lease uses at most one SSH session at a time.
+
 ### SSH Profiles
 
 Profile JSON may be an object with `profiles` and an optional `default`, or an array of profiles. Object maps are also accepted. Each profile supports `id`, `label` or `name`, `host`, `port`, `user` or `username`, `password`, `private_key`, `private_key_path`, `sudo_enabled`, and `default`. Hostnames and credentials never appear in `list-profiles`, `health`, tool descriptions, or audit arguments.
