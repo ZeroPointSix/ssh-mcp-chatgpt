@@ -110,6 +110,7 @@ describe("SshConnectionPool", () => {
     second.release();
     pool.closeAll();
   });
+
   it("rejects when the transport closes before SSH is ready", async () => {
     const clients: FakeClient[] = [];
     const pool = new SshConnectionPool(
@@ -146,13 +147,14 @@ describe("SshConnectionPool", () => {
 
     clients[0].emit("close");
     const results = await Promise.allSettled([first, second]);
-    expect(results).toHaveLength(2);
+    expect(results.map((result) => result.status)).toEqual([
+      "rejected",
+      "rejected",
+    ]);
     for (const result of results) {
-      expect(result.status).toBe("rejected");
       if (result.status === "rejected") {
-        expect(result.reason).toEqual(
-          expect.objectContaining({ message: "SSH connection closed before ready" }),
-        );
+        expect(result.reason).toBeInstanceOf(Error);
+        expect(result.reason.message).toBe("SSH connection closed before ready");
       }
     }
 
@@ -168,5 +170,4 @@ describe("SshConnectionPool", () => {
     recovered.release();
     pool.closeAll();
   });
-
 });
