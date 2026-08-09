@@ -59,7 +59,7 @@ export class SshConnectionPool {
     ),
     private readonly maxChannelsPerConnection = positiveIntegerEnv(
       "SSH_MCP_POOL_MAX_CHANNELS_PER_CONNECTION",
-      8,
+      4,
     ),
     private readonly acquireTimeoutMs = positiveIntegerEnv(
       "SSH_MCP_POOL_ACQUIRE_TIMEOUT_MS",
