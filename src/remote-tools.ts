@@ -904,7 +904,7 @@ export async function prepareRemoteScript(
 
   return withClient(context.sshConfig, async (conn) => {
     const elevate = options.elevate === true;
-    let scriptPath: string;
+    let scriptPath: string | undefined;
     let staged = false;
 
     try {
@@ -928,10 +928,15 @@ export async function prepareRemoteScript(
         scriptPath = await canonicalizePath(conn, options.path ?? "", context);
       }
 
+      if (!scriptPath) {
+        throw new RemoteToolError("path", "Unable to resolve remote script path");
+      }
+      const preparedScriptPath = scriptPath;
+
       if (options.checkSyntax !== false) {
         const syntax = await execCommand(
           conn,
-          commandForElevation(syntaxCommand(interpreter, scriptPath), elevate, context),
+          commandForElevation(syntaxCommand(interpreter, preparedScriptPath), elevate, context),
         );
         if (syntax.exitCode !== 0 || syntax.signal) {
           const detail = (syntax.stderr.length ? syntax.stderr : syntax.stdout).toString("utf8").trim();
@@ -950,14 +955,14 @@ export async function prepareRemoteScript(
         ...(cwd ? ["cd " + quoteShell(cwd) + " &&"] : []),
         ...(envArgs.length ? ["env", ...envArgs] : []),
         interpreter,
-        quoteShell(scriptPath),
+        quoteShell(preparedScriptPath),
         ...args.map(quoteShell),
       ];
       let command = commandParts.join(" ");
       if (staged) {
         command =
           "trap " +
-          quoteShell("rm -f -- " + quoteShell(scriptPath)) +
+          quoteShell("rm -f -- " + quoteShell(preparedScriptPath)) +
           " EXIT; " +
           command;
       }
@@ -972,7 +977,7 @@ export async function prepareRemoteScript(
               await withClient(context.sshConfig, async (cleanupConn) => {
                 await checkedCommand(
                   cleanupConn,
-                  commandForElevation("rm -f -- " + quoteShell(scriptPath), elevate, context),
+                  commandForElevation("rm -f -- " + quoteShell(preparedScriptPath), elevate, context),
                   "cleanup",
                 );
               });
@@ -980,7 +985,7 @@ export async function prepareRemoteScript(
           : undefined,
       };
     } catch (error) {
-      if (staged) {
+      if (staged && scriptPath) {
         await execCommand(
           conn,
           commandForElevation("rm -f -- " + quoteShell(scriptPath), elevate, context),
