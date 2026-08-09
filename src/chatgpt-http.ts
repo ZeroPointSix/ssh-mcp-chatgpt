@@ -1243,11 +1243,12 @@ function startSshCommandJob(
   }
 
   // Acquire in the background so expire_time_ms can return job_id while waiting
-  // for handshake or pool capacity. Bound acquire by expire/kill/readyTimeout.
+  // for handshake or pool capacity. expire_time_ms only controls when the HTTP
+  // caller receives the job_id; the acquire itself is bounded by kill_time_ms
+  // (if set) or the pool/ready timeout defaults.
   const acquireTimeoutMs = Math.max(
     1,
     Math.min(
-      Number.isFinite(expireTimeMs) ? expireTimeMs : Number.POSITIVE_INFINITY,
       killTimeMs ?? Number.POSITIVE_INFINITY,
       sshConfig.readyTimeout ?? 30_000,
     ),
@@ -1256,7 +1257,8 @@ function startSshCommandJob(
   void (async () => {
     try {
       const lease = await acquireSshConnection(sshConfig, {
-        timeoutMs: acquireTimeoutMs,
+        // When kill_time_ms is unset, omit timeoutMs so the pool default applies.
+        ...(Number.isFinite(acquireTimeoutMs) ? { timeoutMs: acquireTimeoutMs } : {}),
         signal: acquireAbort.signal,
       });
       if (isTerminalJobStatus(job.status) || job.stopRequestedStatus) {

@@ -55,8 +55,10 @@ describe("ChatGPT HTTP acquire timeout contract", () => {
     poolMock.acquire.mockImplementation(
       (_config: unknown, options: { timeoutMs?: number; signal?: AbortSignal } = {}) =>
         new Promise((_resolve, reject) => {
+          // Simulate a slow handshake that exceeds expire_time_ms but finishes
+          // before kill_time_ms / pool default.
           const timer = setTimeout(() => {
-            reject(new Error("SSH connection pool acquire timed out after 80ms"));
+            reject(new Error("SSH connection pool acquire timed out after 5000ms"));
           }, options.timeoutMs ?? 30_000);
           timer.unref?.();
           options.signal?.addEventListener(
@@ -85,17 +87,17 @@ describe("ChatGPT HTTP acquire timeout contract", () => {
     );
     const elapsed = Date.now() - startedAt;
 
-    // Critical contract: caller is not blocked for the full pool default (30s).
+    // Critical contract: caller gets job_id within expire_time_ms even while acquire pending.
     expect(elapsed).toBeLessThan(1_000);
     expect(result.job_id).toMatch(/^job-/);
+    expect(result.status).toBe("running");
     expect(poolMock.acquire).toHaveBeenCalled();
-    expect(poolMock.acquire.mock.calls[0][1].timeoutMs).toBe(80);
+    // acquire is bounded by kill_time_ms, not expire_time_ms.
+    expect(poolMock.acquire.mock.calls[0][1].timeoutMs).toBe(5_000);
 
-    // Depending on scheduling, the first response may already be terminal if
-    // acquire failed inside the expire window; otherwise poll until terminal.
     let current = result;
-    for (let attempt = 0; attempt < 20 && current.status === "running"; attempt += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 30));
+    for (let attempt = 0; attempt < 40 && current.status === "running"; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
       current = await invokeTool(
         "exec-status",
         { job_id: result.job_id, note: "poll hung acquire" },
@@ -104,9 +106,8 @@ describe("ChatGPT HTTP acquire timeout contract", () => {
       );
     }
 
-    expect(["running", "failed"].includes(String(result.status))).toBe(true);
     expect(current.status).toBe("failed");
     expect(String(current.error)).toContain("SSH connection error:");
     expect(String(current.error)).toContain("timed out");
-  });
+  }, 10_000);
 });
