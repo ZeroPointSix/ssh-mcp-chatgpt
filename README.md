@@ -162,7 +162,7 @@ Example MCP client config:
 | `SSH_MCP_SUDO_PASSWORD` | Optional sudo password used only server-side. |
 | `SSH_MCP_MAX_CHARS` | Maximum command length. Defaults to `none`; set a positive integer to enforce a deployment limit. |
 | `SSH_MCP_POOL_MAX_CONNECTIONS_PER_TARGET` | Maximum pooled SSH connections per target, default `2`. |
-| `SSH_MCP_POOL_MAX_CHANNELS_PER_CONNECTION` | Maximum concurrent operation leases per pooled connection, default `8`. Each lease holds at most one SSH session channel at a time. |
+| `SSH_MCP_POOL_MAX_CHANNELS_PER_CONNECTION` | Maximum concurrent operation leases per pooled connection, default `4`. Each lease holds at most one SSH session channel at a time. |
 | `SSH_MCP_POOL_ACQUIRE_TIMEOUT_MS` | Maximum wait for pool capacity, default `30000` milliseconds. |
 | `SSH_MCP_POOL_IDLE_TIMEOUT_MS` | Idle pooled connection lifetime, default `60000` milliseconds. |
 | `SSH_MCP_EXEC_EXPIRE_TIME_MS` | HTTP `exec` wait window before returning a background `job_id`, default `55000`. |
