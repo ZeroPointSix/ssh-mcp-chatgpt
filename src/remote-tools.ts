@@ -6,6 +6,7 @@ import { withSshConnection } from "./ssh-connection-pool.js";
 
 const MAX_REMOTE_FILE_BYTES = 8 * 1024 * 1024;
 const MCP_USER_ROOT = "/tmp/.mcp/users";
+const SFTP_CLOSE_TIMEOUT_MS = 5_000;
 
 export function remoteWorkspaceRoot(context: RemoteToolContext, kind: "staging" | "scripts"): string {
   const safeUser = context.sshConfig.username.replace(/[^A-Za-z0-9_.-]/g, "_") || "unknown";
@@ -356,9 +357,20 @@ function sftpWriteFile(sftp: SFTPWrapper, path: string, content: Buffer): Promis
   });
 }
 
-type ClosableSftp = SFTPWrapper & { outgoing?: { state?: string } };
+type ClosableSftp = SFTPWrapper & {
+  outgoing?: { state?: string };
+  destroy?: () => void;
+};
 
-function closeSftp(sftp: SFTPWrapper): Promise<void> {
+/**
+ * Close an SFTP channel and wait for transport confirmation.
+ * If the peer never emits `close`, force-destroy after a short timeout so
+ * pooled leases cannot remain stuck forever.
+ */
+export function closeSftp(
+  sftp: SFTPWrapper,
+  timeoutMs: number = SFTP_CLOSE_TIMEOUT_MS,
+): Promise<void> {
   const channel = sftp as ClosableSftp;
   if (channel.outgoing?.state === "closed") return Promise.resolve();
 
@@ -367,10 +379,31 @@ function closeSftp(sftp: SFTPWrapper): Promise<void> {
     const finish = () => {
       if (settled) return;
       settled = true;
+      clearTimeout(timer);
       sftp.removeListener("close", finish);
+      sftp.removeListener("error", finish);
+      sftp.removeListener("end", finish);
       resolve();
     };
+
+    const timer = setTimeout(() => {
+      try {
+        channel.destroy?.();
+      } catch {
+        /* ignore forced cleanup errors */
+      }
+      try {
+        sftp.end();
+      } catch {
+        /* ignore */
+      }
+      finish();
+    }, Math.max(1, timeoutMs));
+    timer.unref?.();
+
     sftp.once("close", finish);
+    sftp.once("error", finish);
+    sftp.once("end", finish);
     try {
       sftp.end();
     } catch {

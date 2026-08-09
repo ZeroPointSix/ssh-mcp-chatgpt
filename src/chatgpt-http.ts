@@ -29,7 +29,7 @@ type JsonRpcId = string | number | null;
 type JsonObject = Record<string, unknown>;
 
 const SERVER_NAME = "ssh-mcp-chatgpt";
-const SERVER_VERSION = "1.6.7-chatgpt.0";
+const SERVER_VERSION = "1.6.8-chatgpt.0";
 const STREAMABLE_HTTP_ACCEPT = "application/json, text/event-stream";
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const CODE_TTL_MS = 5 * 60 * 1000;
@@ -159,6 +159,7 @@ interface CommandJob {
   cleanupStarted?: boolean;
   cleanupError?: string;
   waiters: Set<() => void>;
+  acquireAbort?: AbortController;
 }
 
 interface ClientRegistration {
@@ -1094,9 +1095,15 @@ function requestStopCommandJob(job: CommandJob, status: CommandJobStopStatus, er
   job.stopRequestedStatus = status;
   job.stopRequestedAt ??= Date.now();
   job.stopReason = error;
+  try {
+    job.acquireAbort?.abort();
+  } catch {
+    /* ignore */
+  }
 
   if (!job.startedAt && !job.stream) {
     try { job.conn?.end(); } catch { /* ignore */ }
+    // Still acquiring or not yet started: stop immediately without remote cancel helper.
     finalizeStoppedCommandJob(job);
     return true;
   }
@@ -1106,54 +1113,22 @@ function requestStopCommandJob(job: CommandJob, status: CommandJobStopStatus, er
   return true;
 }
 
-async function startSshCommandJob(
-  tool: CommandTool,
-  target: ResolvedSshTarget,
-  sshConfig: SSHConfig,
+function beginSshCommandExecution(
+  job: CommandJob,
+  lease: SshConnectionLease,
   remoteCommand: string,
-  commandLength: number,
-  expireTimeMs: number,
-  outputMaxChars: number,
-  killTimeMs?: number,
   stdin?: string,
-  cleanup?: () => Promise<void>,
-  stopCommandFactory: (jobId: string) => string = buildManagedRemoteCancelCommand,
-): Promise<CommandJob> {
-  const jobId = `job-${randomToken(12)}`;
-  const job: CommandJob = {
-    id: jobId,
-    tool,
-    targetId: target.id,
-    targetLabel: target.label,
-    commandLength,
-    status: "running",
-    createdAt: Date.now(),
-    expireTimeMs,
-    killTimeMs,
-    outputMaxChars,
-    stdout: "",
-    stderr: "",
-    stdoutChars: 0,
-    stderrChars: 0,
-    stdoutTruncated: false,
-    stderrTruncated: false,
-    sshConfig,
-    stopCommand: stopCommandFactory(jobId),
-    cleanup,
-    waiters: new Set(),
-  };
-  commandJobs.set(job.id, job);
-
-  let lease: SshConnectionLease;
-  try {
-    lease = await acquireSshConnection(sshConfig);
-  } catch (error) {
-    const detail =
-      error instanceof Error
-        ? redactSshConnectionError(error.message)
-        : "Unknown SSH connection failure";
-    failCommandJob(job, `SSH connection error: ${detail}`);
-    return job;
+): void {
+  if (isTerminalJobStatus(job.status) || job.stopRequestedStatus) {
+    try {
+      lease.release(true);
+    } catch {
+      /* ignore */
+    }
+    if (job.stopRequestedStatus && !isTerminalJobStatus(job.status)) {
+      finalizeStoppedCommandJob(job);
+    }
+    return;
   }
 
   const conn = lease.client;
@@ -1163,13 +1138,6 @@ async function startSshCommandJob(
     usesStdin: stdin !== undefined,
     jobId: job.id,
   });
-
-  if (killTimeMs) {
-    job.killTimer = setTimeout(() => {
-      requestStopCommandJob(job, "killed", `Command exceeded kill_time_ms (${killTimeMs}ms)`);
-    }, killTimeMs);
-    job.killTimer.unref?.();
-  }
 
   job.onConnectionError = (err: Error) => {
     job.connectionUnhealthy = true;
@@ -1224,6 +1192,100 @@ async function startSshCommandJob(
       finishCommandJob(job, { status: "completed" });
     });
   });
+}
+
+function startSshCommandJob(
+  tool: CommandTool,
+  target: ResolvedSshTarget,
+  sshConfig: SSHConfig,
+  remoteCommand: string,
+  commandLength: number,
+  expireTimeMs: number,
+  outputMaxChars: number,
+  killTimeMs?: number,
+  stdin?: string,
+  cleanup?: () => Promise<void>,
+  stopCommandFactory: (jobId: string) => string = buildManagedRemoteCancelCommand,
+): CommandJob {
+  const jobId = `job-${randomToken(12)}`;
+  const acquireAbort = new AbortController();
+  const job: CommandJob = {
+    id: jobId,
+    tool,
+    targetId: target.id,
+    targetLabel: target.label,
+    commandLength,
+    status: "running",
+    createdAt: Date.now(),
+    expireTimeMs,
+    killTimeMs,
+    outputMaxChars,
+    stdout: "",
+    stderr: "",
+    stdoutChars: 0,
+    stderrChars: 0,
+    stdoutTruncated: false,
+    stderrTruncated: false,
+    sshConfig,
+    stopCommand: stopCommandFactory(jobId),
+    cleanup,
+    waiters: new Set(),
+    acquireAbort,
+  };
+  commandJobs.set(job.id, job);
+
+  // Start hard kill deadline from job creation so pool/handshake waits count.
+  if (killTimeMs) {
+    job.killTimer = setTimeout(() => {
+      requestStopCommandJob(job, "killed", `Command exceeded kill_time_ms (${killTimeMs}ms)`);
+    }, killTimeMs);
+    job.killTimer.unref?.();
+  }
+
+  // Acquire in the background so expire_time_ms can return job_id while waiting
+  // for handshake or pool capacity. Bound acquire by expire/kill/readyTimeout.
+  const acquireTimeoutMs = Math.max(
+    1,
+    Math.min(
+      Number.isFinite(expireTimeMs) ? expireTimeMs : Number.POSITIVE_INFINITY,
+      killTimeMs ?? Number.POSITIVE_INFINITY,
+      sshConfig.readyTimeout ?? 30_000,
+    ),
+  );
+
+  void (async () => {
+    try {
+      const lease = await acquireSshConnection(sshConfig, {
+        timeoutMs: acquireTimeoutMs,
+        signal: acquireAbort.signal,
+      });
+      if (isTerminalJobStatus(job.status) || job.stopRequestedStatus) {
+        try {
+          lease.release(true);
+        } catch {
+          /* ignore */
+        }
+        if (job.stopRequestedStatus && !isTerminalJobStatus(job.status)) {
+          finalizeStoppedCommandJob(job);
+        }
+        return;
+      }
+      beginSshCommandExecution(job, lease, remoteCommand, stdin);
+    } catch (error) {
+      if (isTerminalJobStatus(job.status)) return;
+      if (job.stopRequestedStatus) {
+        finalizeStoppedCommandJob(job);
+        return;
+      }
+      const detail =
+        error instanceof Error
+          ? redactSshConnectionError(error.message)
+          : "Unknown SSH connection failure";
+      failCommandJob(job, `SSH connection error: ${detail}`);
+    } finally {
+      job.acquireAbort = undefined;
+    }
+  })();
 
   return job;
 }
@@ -1349,7 +1411,7 @@ async function runSshTool(name: "exec" | "sudo-exec", args: JsonObject, config: 
   }
 
   const sshConfig = await loadSshConfig(target);
-  const job = await startSshCommandJob(
+  const job = startSshCommandJob(
     name,
     target,
     sshConfig,
@@ -1444,7 +1506,7 @@ async function runScriptTool(args: JsonObject, config: RuntimeConfig, target: Re
   const expireTimeMs =
     parseDurationArg(args.expire_time_ms, config.execExpireTimeMs, "expire_time_ms") ??
     config.execExpireTimeMs;
-  const job = await startSshCommandJob(
+  const job = startSshCommandJob(
     "run-script",
     target,
     await loadSshConfig(target),

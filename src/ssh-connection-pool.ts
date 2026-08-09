@@ -14,6 +14,13 @@ export interface SshConnectionLease {
   release: (unhealthy?: boolean) => void;
 }
 
+export interface SshConnectionAcquireOptions {
+  /** Hard deadline for the whole acquire path, including handshake and capacity wait. */
+  timeoutMs?: number;
+  /** Optional cancellation signal that aborts a pending acquire. */
+  signal?: AbortSignal;
+}
+
 export interface SshConnectionPoolStatus {
   targets: number;
   connections: number;
@@ -23,6 +30,16 @@ export interface SshConnectionPoolStatus {
   created_total: number;
   max_connections_per_target: number;
   max_channels_per_connection: number;
+}
+
+export class SshConnectionAcquireError extends Error {
+  constructor(
+    message: string,
+    public readonly code: "TIMEOUT" | "ABORTED" | "CONNECT_FAILED" = "CONNECT_FAILED",
+  ) {
+    super(message);
+    this.name = "SshConnectionAcquireError";
+  }
 }
 
 function positiveIntegerEnv(name: string, fallback: number): number {
@@ -45,9 +62,19 @@ function configKey(config: SSHConfig): string {
   });
 }
 
+type CreationResult =
+  | { ok: true; entry: PoolEntry }
+  | { ok: false; error: Error };
+
+interface InflightCreation {
+  promise: Promise<CreationResult>;
+  client: Client;
+  abort: () => void;
+}
+
 export class SshConnectionPool {
   private readonly entries = new Map<string, PoolEntry[]>();
-  private readonly creating = new Map<string, Promise<PoolEntry>>();
+  private readonly creating = new Map<string, InflightCreation>();
   private readonly waiters = new Map<string, Set<() => void>>();
   private readonly idleTimer: NodeJS.Timeout;
   private createdTotal = 0;
@@ -78,30 +105,69 @@ export class SshConnectionPool {
     this.idleTimer.unref?.();
   }
 
-  async acquire(config: SSHConfig): Promise<SshConnectionLease> {
+  async acquire(
+    config: SSHConfig,
+    options: SshConnectionAcquireOptions = {},
+  ): Promise<SshConnectionLease> {
     const key = configKey(config);
+    const startedAt = Date.now();
+    const timeoutMs =
+      options.timeoutMs !== undefined && Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
+        ? Math.floor(options.timeoutMs)
+        : this.acquireTimeoutMs;
+    const deadlineAt = startedAt + timeoutMs;
+    const signal = options.signal;
+
+    if (signal?.aborted) {
+      throw new SshConnectionAcquireError("SSH connection acquire aborted", "ABORTED");
+    }
+
     while (true) {
+      this.throwIfAcquireExpired(deadlineAt, timeoutMs, signal);
+
       const entry = this.findAvailableEntry(key);
       if (entry) return this.lease(key, entry);
 
       const currentEntries = this.liveEntries(key);
-      const inFlight = this.creating.get(key);
-      if (inFlight) {
-        await inFlight;
-        continue;
+      let creation = this.creating.get(key);
+      if (!creation && currentEntries.length < this.maxConnectionsPerTarget) {
+        creation = this.createEntry(key, config);
+        this.creating.set(key, creation);
+        // Keep the in-flight marker until the handshake settles, even if a
+        // waiter times out earlier. That prevents duplicate handshakes.
+        void creation.promise.finally(() => {
+          if (this.creating.get(key) === creation) this.creating.delete(key);
+        });
       }
 
-      if (currentEntries.length < this.maxConnectionsPerTarget) {
-        const creation = this.createEntry(key, config);
-        this.creating.set(key, creation);
+      if (creation) {
+        let result: CreationResult | undefined;
         try {
-          await creation;
-        } finally {
-          if (this.creating.get(key) === creation) this.creating.delete(key);
+          // Shared waiters must observe the same handshake failure. TIMEOUT and
+          // ABORTED still reject only the timed-out waiter.
+          result = await this.awaitWithDeadline(
+            creation.promise,
+            deadlineAt,
+            timeoutMs,
+            signal,
+          );
+        } catch (error) {
+          if (
+            error instanceof SshConnectionAcquireError &&
+            (error.code === "TIMEOUT" || error.code === "ABORTED")
+          ) {
+            // Stop a hung handshake so the slot is not stuck forever.
+            creation.abort();
+          }
+          throw error;
+        }
+        if (result && !result.ok) {
+          throw result.error;
         }
         continue;
       }
-      await this.waitForCapacity(key);
+
+      await this.waitForCapacity(key, deadlineAt, timeoutMs, signal);
     }
   }
 
@@ -171,63 +237,194 @@ export class SshConnectionPool {
     };
   }
 
-  private createEntry(key: string, config: SSHConfig): Promise<PoolEntry> {
-    return new Promise((resolve, reject) => {
-      const client = this.clientFactory();
-      const entry: PoolEntry = {
-        client,
-        activeLeases: 0,
-        lastUsedAt: Date.now(),
-        dead: false,
-      };
+  private createEntry(key: string, config: SSHConfig): InflightCreation {
+    const client = this.clientFactory();
+    let settled = false;
+    let aborted = false;
+    let resolveCreation!: (result: CreationResult) => void;
+    const entry: PoolEntry = {
+      client,
+      activeLeases: 0,
+      lastUsedAt: Date.now(),
+      dead: false,
+    };
+
+    // Always resolve (never reject) so late handshake failures cannot surface as
+    // unhandledRejection after waiters already timed out.
+    const promise = new Promise<CreationResult>((resolve) => {
+      resolveCreation = resolve;
+    });
+
+    const fail = (error: Error) => {
+      entry.dead = true;
+      if (settled) {
+        this.destroyEntry(entry);
+        this.wakeOne(key);
+        return;
+      }
+      settled = true;
+      resolveCreation({ ok: false, error });
+      this.wakeOne(key);
+    };
+
+    client.once("ready", () => {
+      if (settled || aborted) return;
+      settled = true;
+      this.createdTotal += 1;
+      const entries = this.entries.get(key) ?? [];
+      entries.push(entry);
+      this.entries.set(key, entries);
+      resolveCreation({ ok: true, entry });
+    });
+    client.on("error", (error: Error) => {
+      fail(error);
+    });
+    client.on("close", () => {
+      fail(new Error("SSH connection closed before ready"));
+    });
+    try {
+      client.connect(config);
+    } catch (error) {
+      fail(error instanceof Error ? error : new Error(String(error)));
+    }
+
+    return {
+      promise,
+      client,
+      abort: () => {
+        if (settled || aborted) return;
+        aborted = true;
+        settled = true;
+        entry.dead = true;
+        if (this.creating.get(key)?.client === client) this.creating.delete(key);
+        resolveCreation({
+          ok: false,
+          error: new Error("SSH connection handshake aborted"),
+        });
+        try {
+          client.end();
+        } catch {
+          /* ignore */
+        }
+        this.wakeOne(key);
+      },
+    };
+  }
+
+  private remainingMs(deadlineAt: number): number {
+    return Math.max(0, deadlineAt - Date.now());
+  }
+
+  private throwIfAcquireExpired(
+    deadlineAt: number,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): void {
+    if (signal?.aborted) {
+      throw new SshConnectionAcquireError("SSH connection acquire aborted", "ABORTED");
+    }
+    if (Date.now() >= deadlineAt) {
+      throw new SshConnectionAcquireError(
+        `SSH connection pool acquire timed out after ${timeoutMs}ms`,
+        "TIMEOUT",
+      );
+    }
+  }
+
+  private awaitWithDeadline<T>(
+    promise: Promise<T>,
+    deadlineAt: number,
+    timeoutMs: number,
+    signal?: AbortSignal,
+    mode: "propagate-errors" | "ignore-errors" = "propagate-errors",
+  ): Promise<T | undefined> {
+    this.throwIfAcquireExpired(deadlineAt, timeoutMs, signal);
+    return new Promise<T | undefined>((resolve, reject) => {
       let settled = false;
-      client.once("ready", () => {
+      const cleanup = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+      };
+      const finishResolve = (value?: T) => {
         if (settled) return;
         settled = true;
-        this.createdTotal += 1;
-        const entries = this.entries.get(key) ?? [];
-        entries.push(entry);
-        this.entries.set(key, entries);
-        resolve(entry);
-      });
-      client.on("error", (error: Error) => {
-        entry.dead = true;
-        if (!settled) {
-          settled = true;
-          reject(error);
-        }
-        this.wakeOne(key);
-      });
-      client.on("close", () => {
-        entry.dead = true;
-        if (!settled) {
-          settled = true;
-          reject(new Error("SSH connection closed before ready"));
-        }
-        this.wakeOne(key);
-      });
-      client.connect(config);
+        cleanup();
+        resolve(value);
+      };
+      const finishReject = (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      };
+      const onAbort = () => {
+        finishReject(new SshConnectionAcquireError("SSH connection acquire aborted", "ABORTED"));
+      };
+      const timer = setTimeout(() => {
+        finishReject(
+          new SshConnectionAcquireError(
+            `SSH connection pool acquire timed out after ${timeoutMs}ms`,
+            "TIMEOUT",
+          ),
+        );
+      }, this.remainingMs(deadlineAt));
+      timer.unref?.();
+      signal?.addEventListener("abort", onAbort, { once: true });
+
+      promise.then(
+        (value) => finishResolve(value),
+        (error) => {
+          if (mode === "ignore-errors") finishResolve(undefined);
+          else finishReject(error);
+        },
+      );
     });
   }
 
-  private waitForCapacity(key: string): Promise<void> {
+  private waitForCapacity(
+    key: string,
+    deadlineAt: number,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    this.throwIfAcquireExpired(deadlineAt, timeoutMs, signal);
     return new Promise((resolve, reject) => {
       const waiters = this.waiters.get(key) ?? new Set<() => void>();
-      let timer: NodeJS.Timeout;
-      const wake = () => {
+      let settled = false;
+      const cleanup = () => {
         clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
         waiters.delete(wake);
         if (waiters.size === 0) this.waiters.delete(key);
+      };
+      const finishResolve = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
         resolve();
+      };
+      const finishReject = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      };
+      const wake = () => finishResolve();
+      const onAbort = () => {
+        finishReject(new SshConnectionAcquireError("SSH connection acquire aborted", "ABORTED"));
       };
       waiters.add(wake);
       this.waiters.set(key, waiters);
-      timer = setTimeout(() => {
-        waiters.delete(wake);
-        if (waiters.size === 0) this.waiters.delete(key);
-        reject(new Error(`SSH connection pool acquire timed out after ${this.acquireTimeoutMs}ms`));
-      }, this.acquireTimeoutMs);
+      const timer = setTimeout(() => {
+        finishReject(
+          new SshConnectionAcquireError(
+            `SSH connection pool acquire timed out after ${timeoutMs}ms`,
+            "TIMEOUT",
+          ),
+        );
+      }, this.remainingMs(deadlineAt));
       timer.unref?.();
+      signal?.addEventListener("abort", onAbort, { once: true });
     });
   }
 
@@ -263,15 +460,19 @@ export class SshConnectionPool {
 
 export const sshConnectionPool = new SshConnectionPool();
 
-export function acquireSshConnection(config: SSHConfig): Promise<SshConnectionLease> {
-  return sshConnectionPool.acquire(config);
+export function acquireSshConnection(
+  config: SSHConfig,
+  options?: SshConnectionAcquireOptions,
+): Promise<SshConnectionLease> {
+  return sshConnectionPool.acquire(config, options);
 }
 
 export async function withSshConnection<T>(
   config: SSHConfig,
   callback: (client: Client) => Promise<T>,
+  options?: SshConnectionAcquireOptions,
 ): Promise<T> {
-  const lease = await acquireSshConnection(config);
+  const lease = await acquireSshConnection(config, options);
   try {
     return await callback(lease.client);
   } finally {

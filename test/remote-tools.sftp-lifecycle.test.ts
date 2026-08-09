@@ -10,7 +10,7 @@ vi.mock("../src/ssh-connection-pool.js", () => ({
   ),
 }));
 
-import { writeRemoteFile } from "../src/remote-tools.js";
+import { closeSftp, writeRemoteFile } from "../src/remote-tools.js";
 
 class FakeChannel extends EventEmitter {
   readonly stderr = new EventEmitter();
@@ -94,6 +94,21 @@ describe("remote tool SFTP lifecycle", () => {
     expect(lifecycle.indexOf("sftp-close")).toBeLessThan(
       lifecycle.findIndex((entry) => entry.startsWith("exec:rm -f --")),
     );
+  });
+
+  it("force-finishes closeSftp when the peer never emits close", async () => {
+    const destroy = vi.fn();
+    const sftp = Object.assign(new EventEmitter(), {
+      end: vi.fn(),
+      destroy,
+      outgoing: { state: "open" },
+    });
+
+    const started = Date.now();
+    await closeSftp(sftp as any, 25);
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(sftp.end).toHaveBeenCalled();
+    expect(destroy).toHaveBeenCalledOnce();
   });
 });
 

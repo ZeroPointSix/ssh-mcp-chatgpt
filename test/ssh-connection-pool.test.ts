@@ -200,4 +200,44 @@ describe("SshConnectionPool", () => {
     recovered.release();
     pool.closeAll();
   });
+
+  it("times out a slow handshake before the pool default wait elapses", async () => {
+    const clients: FakeClient[] = [];
+    const pool = new SshConnectionPool(
+      1,
+      1,
+      5_000,
+      60_000,
+      fakeFactory(clients, false),
+    );
+
+    const started = Date.now();
+    await expect(pool.acquire(config, { timeoutMs: 30 })).rejects.toThrow(
+      "SSH connection pool acquire timed out after 30ms",
+    );
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(pool.status()).toMatchObject({
+      connections: 0,
+      waiting_acquires: 0,
+      created_total: 0,
+    });
+    pool.closeAll();
+  });
+
+  it("aborts a pending acquire when the signal fires", async () => {
+    const clients: FakeClient[] = [];
+    const pool = new SshConnectionPool(
+      1,
+      1,
+      5_000,
+      60_000,
+      fakeFactory(clients, false),
+    );
+    const controller = new AbortController();
+    const pending = pool.acquire(config, { signal: controller.signal });
+    queueMicrotask(() => controller.abort());
+    await expect(pending).rejects.toThrow("SSH connection acquire aborted");
+    expect(pool.status().waiting_acquires).toBe(0);
+    pool.closeAll();
+  });
 });
