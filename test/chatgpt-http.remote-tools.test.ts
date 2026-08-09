@@ -225,6 +225,43 @@ describe('Claude Code-style remote tools', () => {
     );
   }, 30000);
 
+
+  it('keeps concurrent pooled writes within the OpenSSH session limit', async () => {
+    configureSshTarget();
+    const config = loadRuntimeConfig();
+    const root = '/tmp/ssh-mcp-pool-' + Date.now();
+    const content = 'x'.repeat(256 * 1024);
+
+    try {
+      const results = await Promise.all(
+        Array.from({ length: 16 }, (_, index) =>
+          invokeTool(
+            'fs-write',
+            {
+              path: root + '/file-' + index + '.txt',
+              content,
+              create_dirs: true,
+              backup: false,
+              note: 'verify pooled SFTP concurrency',
+            },
+            'test-session',
+            config,
+          ),
+        ),
+      );
+
+      expect(results).toHaveLength(16);
+      expect(results.every((result) => result.bytes_written === content.length)).toBe(true);
+    } finally {
+      await invokeTool(
+        'exec',
+        { command: "rm -rf -- '" + root + "'", note: 'clean pooled write fixtures' },
+        'test-session',
+        config,
+      ).catch(() => undefined);
+    }
+  }, 60000);
+
   it('rejects oversized files before reading their content', async () => {
     configureSshTarget();
     const config = loadRuntimeConfig();
@@ -453,3 +490,4 @@ describe('12-case L1-L5 tool corpus', () => {
     );
   }, 20000);
 });
+
