@@ -7,8 +7,12 @@ import { SshConnectionPool } from "../src/ssh-connection-pool.js";
 class FakeClient extends EventEmitter {
   ended = false;
 
+  constructor(private readonly autoReady = true) {
+    super();
+  }
+
   connect(): void {
-    queueMicrotask(() => this.emit("ready"));
+    if (this.autoReady) queueMicrotask(() => this.emit("ready"));
   }
 
   end(): void {
@@ -24,9 +28,9 @@ const config: SSHConfig = {
   password: "secret",
 };
 
-function fakeFactory(clients: FakeClient[]): () => Client {
+function fakeFactory(clients: FakeClient[], autoReady = true): () => Client {
   return () => {
-    const client = new FakeClient();
+    const client = new FakeClient(autoReady);
     clients.push(client);
     return client as unknown as Client;
   };
@@ -106,4 +110,63 @@ describe("SshConnectionPool", () => {
     second.release();
     pool.closeAll();
   });
+  it("rejects when the transport closes before SSH is ready", async () => {
+    const clients: FakeClient[] = [];
+    const pool = new SshConnectionPool(
+      1,
+      1,
+      1_000,
+      60_000,
+      fakeFactory(clients, false),
+    );
+
+    const pending = pool.acquire(config);
+    clients[0].emit("close");
+
+    await expect(pending).rejects.toThrow("SSH connection closed before ready");
+    expect(pool.status()).toMatchObject({
+      connections: 0,
+      created_total: 0,
+    });
+    pool.closeAll();
+  });
+
+  it("rejects all acquires sharing a failed handshake and allows a retry", async () => {
+    const clients: FakeClient[] = [];
+    let attempt = 0;
+    const pool = new SshConnectionPool(1, 1, 1_000, 60_000, () => {
+      const client = new FakeClient(attempt++ > 0);
+      clients.push(client);
+      return client as unknown as Client;
+    });
+
+    const first = pool.acquire(config);
+    const second = pool.acquire(config);
+    expect(clients).toHaveLength(1);
+
+    clients[0].emit("close");
+    const results = await Promise.allSettled([first, second]);
+    expect(results).toHaveLength(2);
+    for (const result of results) {
+      expect(result.status).toBe("rejected");
+      if (result.status === "rejected") {
+        expect(result.reason).toEqual(
+          expect.objectContaining({ message: "SSH connection closed before ready" }),
+        );
+      }
+    }
+
+    const recovered = await pool.acquire(config);
+    expect(clients).toHaveLength(2);
+    expect(recovered.client).toBe(clients[1]);
+    expect(pool.status()).toMatchObject({
+      connections: 1,
+      active_leases: 1,
+      created_total: 1,
+    });
+
+    recovered.release();
+    pool.closeAll();
+  });
+
 });
