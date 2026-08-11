@@ -966,7 +966,9 @@ function finishCommandJob(job: CommandJob, updates: Partial<CommandJob>): void {
 
 function failCommandJob(job: CommandJob, error: string): void {
   if (job.stopRequestedStatus) {
-    finishCommandJob(job, { status: job.stopRequestedStatus, error: job.stopReason ?? error });
+    if (!job.stopControlStarted) {
+      finishCommandJob(job, { status: job.stopRequestedStatus, error: job.stopReason ?? error });
+    }
     return;
   }
   finishCommandJob(job, { status: "failed", error });
@@ -1147,7 +1149,7 @@ function beginSshCommandExecution(
     job.connectionUnhealthy = true;
     if (isTerminalJobStatus(job.status)) return;
     if (job.stopRequestedStatus) {
-      finalizeStoppedCommandJob(job);
+      if (!job.stopControlStarted) finalizeStoppedCommandJob(job);
       return;
     }
     if (job.status === "running") {
@@ -1186,7 +1188,7 @@ function beginSshCommandExecution(
       job.exitCode = code;
       job.signal = signal;
       if (job.stopRequestedStatus) {
-        finalizeStoppedCommandJob(job);
+        if (!job.stopControlStarted) finalizeStoppedCommandJob(job);
         return;
       }
       finishCommandJob(job, { status: "completed" });
