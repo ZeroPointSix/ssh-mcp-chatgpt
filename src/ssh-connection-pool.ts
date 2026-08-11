@@ -7,8 +7,6 @@ interface PoolEntry {
   activeLeases: number;
   lastUsedAt: number;
   dead: boolean;
-  transportClosed: boolean;
-  endStarted: boolean;
 }
 
 export interface SshConnectionLease {
@@ -71,8 +69,8 @@ type CreationResult =
 interface InflightCreation {
   promise: Promise<CreationResult>;
   client: Client;
-  waiterCount: number;
   abort: () => void;
+  waiters: number;
 }
 
 export class SshConnectionPool {
@@ -145,19 +143,30 @@ export class SshConnectionPool {
 
       if (creation) {
         let result: CreationResult | undefined;
-        creation.waiterCount += 1;
+        let waiterExpired = false;
+        creation.waiters += 1;
         try {
-          // Every waiter owns its deadline. A timeout or abort must not cancel
-          // the shared handshake while another waiter can still use it.
+          // Shared waiters must observe the same handshake failure. TIMEOUT and
+          // ABORTED still reject only the timed-out waiter.
           result = await this.awaitWithDeadline(
             creation.promise,
             deadlineAt,
             timeoutMs,
             signal,
           );
+        } catch (error) {
+          if (
+            error instanceof SshConnectionAcquireError &&
+            (error.code === "TIMEOUT" || error.code === "ABORTED")
+          ) {
+            waiterExpired = true;
+          }
+          throw error;
         } finally {
-          creation.waiterCount = Math.max(0, creation.waiterCount - 1);
-          if (creation.waiterCount === 0) creation.abort();
+          creation.waiters = Math.max(0, creation.waiters - 1);
+          // A caller owns only its wait. Abort the shared handshake only when
+          // no other acquire can still use it.
+          if (waiterExpired && creation.waiters === 0) creation.abort();
         }
         if (result && !result.ok) {
           throw result.error;
@@ -200,8 +209,6 @@ export class SshConnectionPool {
 
   closeAll(): void {
     clearInterval(this.idleTimer);
-    for (const creation of this.creating.values()) creation.abort();
-    this.creating.clear();
     for (const entries of this.entries.values()) {
       for (const entry of entries) this.destroyEntry(entry);
     }
@@ -247,8 +254,6 @@ export class SshConnectionPool {
       activeLeases: 0,
       lastUsedAt: Date.now(),
       dead: false,
-      transportClosed: false,
-      endStarted: false,
     };
 
     // Always resolve (never reject) so late handshake failures cannot surface as
@@ -266,7 +271,6 @@ export class SshConnectionPool {
       }
       settled = true;
       resolveCreation({ ok: false, error });
-      this.destroyEntry(entry);
       this.wakeOne(key);
     };
 
@@ -283,16 +287,7 @@ export class SshConnectionPool {
       fail(error);
     });
     client.on("close", () => {
-      entry.transportClosed = true;
-      if (!settled) {
-        fail(new Error("SSH connection closed before ready"));
-        return;
-      }
-      // The transport is already closed. Detach it immediately without
-      // calling end() again, which can emit another close event.
-      entry.dead = true;
-      this.liveEntries(key);
-      this.wakeOne(key);
+      fail(new Error("SSH connection closed before ready"));
     });
     try {
       client.connect(config);
@@ -303,7 +298,7 @@ export class SshConnectionPool {
     return {
       promise,
       client,
-      waiterCount: 0,
+      waiters: 0,
       abort: () => {
         if (settled || aborted) return;
         aborted = true;
@@ -314,7 +309,11 @@ export class SshConnectionPool {
           ok: false,
           error: new Error("SSH connection handshake aborted"),
         });
-        this.destroyEntry(entry);
+        try {
+          client.end();
+        } catch {
+          /* ignore */
+        }
         this.wakeOne(key);
       },
     };
@@ -459,8 +458,6 @@ export class SshConnectionPool {
 
   private destroyEntry(entry: PoolEntry): void {
     entry.dead = true;
-    if (entry.transportClosed || entry.endStarted) return;
-    entry.endStarted = true;
     try {
       entry.client.end();
     } catch {
