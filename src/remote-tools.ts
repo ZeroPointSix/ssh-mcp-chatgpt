@@ -132,15 +132,23 @@ export function buildManagedRemoteCancelCommand(jobId: string): string {
   const pidPath = managedJobPidPath(jobId);
   const inner = [
     "pid_file=" + quoteShell(pidPath),
+    'finish_cancel() { rm -f -- "$pid_file"; exit 0; }',
     "attempt=0",
     "while [ ! -s \"$pid_file\" ] && [ \"$attempt\" -lt 20 ]; do attempt=$((attempt + 1)); sleep 0.05; done",
     "[ -s \"$pid_file\" ] || exit 3",
-    "pid=$(cat -- \"$pid_file\")",
+    "IFS= read -r pid < \"$pid_file\" || exit 3",
     "case \"$pid\" in ''|*[!0-9]*) exit 4 ;; esac",
+    "[ \"$pid\" -gt 1 ] || exit 4",
+    "kill -0 -- \"-$pid\" 2>/dev/null || finish_cancel",
     "kill -TERM -- \"-$pid\" 2>/dev/null || true",
-    "sleep 0.25",
+    "attempt=0",
+    "while kill -0 -- \"-$pid\" 2>/dev/null && [ \"$attempt\" -lt 10 ]; do attempt=$((attempt + 1)); sleep 0.1; done",
+    "kill -0 -- \"-$pid\" 2>/dev/null || finish_cancel",
     "kill -KILL -- \"-$pid\" 2>/dev/null || true",
-    "rm -f -- \"$pid_file\"",
+    "attempt=0",
+    "while kill -0 -- \"-$pid\" 2>/dev/null && [ \"$attempt\" -lt 10 ]; do attempt=$((attempt + 1)); sleep 0.1; done",
+    "kill -0 -- \"-$pid\" 2>/dev/null && exit 5",
+    "finish_cancel",
   ].join("; ");
   return "bash -c " + quoteShell(inner);
 }
