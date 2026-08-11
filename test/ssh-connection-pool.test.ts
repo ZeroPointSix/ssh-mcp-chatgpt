@@ -201,6 +201,79 @@ describe("SshConnectionPool", () => {
     pool.closeAll();
   });
 
+  it("evicts a ready connection immediately when its transport closes", async () => {
+    const clients: FakeClient[] = [];
+    const pool = new SshConnectionPool(1, 1, 1_000, 60_000, fakeFactory(clients));
+
+    const first = await pool.acquire(config);
+    const failedClient = first.client;
+    clients[0].emit("close");
+
+    expect(pool.status()).toMatchObject({
+      connections: 0,
+      active_leases: 0,
+    });
+
+    first.release();
+    const recovered = await pool.acquire(config);
+    expect(recovered.client).not.toBe(failedClient);
+    expect(clients).toHaveLength(2);
+
+    recovered.release();
+    pool.closeAll();
+  });
+
+  it("isolates a short waiter timeout from a shared handshake", async () => {
+    const clients: FakeClient[] = [];
+    const pool = new SshConnectionPool(
+      1,
+      1,
+      1_000,
+      60_000,
+      fakeFactory(clients, false),
+    );
+
+    const shortWaiter = pool.acquire(config, { timeoutMs: 20 });
+    const longWaiter = pool.acquire(config, { timeoutMs: 500 });
+    await expect(shortWaiter).rejects.toThrow(
+      "SSH connection pool acquire timed out after 20ms",
+    );
+    expect(clients[0].ended).toBe(false);
+
+    clients[0].emit("ready");
+    const recovered = await longWaiter;
+    expect(recovered.client).toBe(clients[0]);
+
+    recovered.release();
+    pool.closeAll();
+  });
+
+  it("isolates one waiter abort from a shared handshake", async () => {
+    const clients: FakeClient[] = [];
+    const pool = new SshConnectionPool(
+      1,
+      1,
+      1_000,
+      60_000,
+      fakeFactory(clients, false),
+    );
+    const controller = new AbortController();
+
+    const abortedWaiter = pool.acquire(config, { signal: controller.signal });
+    const activeWaiter = pool.acquire(config, { timeoutMs: 500 });
+    controller.abort();
+
+    await expect(abortedWaiter).rejects.toThrow("SSH connection acquire aborted");
+    expect(clients[0].ended).toBe(false);
+
+    clients[0].emit("ready");
+    const recovered = await activeWaiter;
+    expect(recovered.client).toBe(clients[0]);
+
+    recovered.release();
+    pool.closeAll();
+  });
+
   it("times out a slow handshake before the pool default wait elapses", async () => {
     const clients: FakeClient[] = [];
     const pool = new SshConnectionPool(
