@@ -6,6 +6,7 @@ const mockState = vi.hoisted(() => ({
   commandStream: undefined as any,
   commandClient: undefined as any,
   stopDelayMs: 0,
+  stopCloseOnEnd: false,
 }));
 
 vi.mock('ssh2', async () => {
@@ -20,7 +21,11 @@ vi.mock('ssh2', async () => {
       mockState.commands.push(command);
       const stream = new EventEmitter() as any;
       stream.stderr = new EventEmitter();
-      stream.end = () => undefined;
+      stream.end = () => {
+        if (command.includes('kill -KILL --') && mockState.stopCloseOnEnd) {
+          stream.emit('close', 0, null);
+        }
+      };
       stream.signal = (_signal: string, signalCallback?: (error?: Error) => void) => {
         signalCallback?.(new Error('SSH signal requests are unsupported'));
       };
@@ -29,7 +34,9 @@ vi.mock('ssh2', async () => {
       queueMicrotask(() => {
         callback(undefined, stream);
         if (command.includes('kill -KILL --')) {
-          setTimeout(() => stream.emit('close', 0, null), mockState.stopDelayMs);
+          if (!mockState.stopCloseOnEnd) {
+            setTimeout(() => stream.emit('close', 0, null), mockState.stopDelayMs);
+          }
         } else {
           mockState.commandStream = stream;
           mockState.commandClient = this;
@@ -61,6 +68,7 @@ afterEach(() => {
   mockState.commandStream = undefined;
   mockState.commandClient = undefined;
   mockState.stopDelayMs = 0;
+  mockState.stopCloseOnEnd = false;
   for (const key of Object.keys(process.env)) {
     if (!(key in originalEnv)) delete process.env[key];
   }
@@ -115,6 +123,35 @@ describe('exec-cancel remote process-group control', () => {
     expect(mockState.commands[1]).toContain(started.job_id + '.pid');
     expect(mockState.commands[1]).toContain('kill -TERM');
     expect(mockState.commands[1]).toContain('kill -KILL');
+  });
+
+  it('observes a helper that closes synchronously when stdin ends', async () => {
+    configureSshTarget();
+    mockState.stopCloseOnEnd = true;
+    const config = loadRuntimeConfig();
+    const started = await invokeTool(
+      'exec',
+      { command: 'sleep 60', expire_time_ms: 10, kill_time_ms: 60000, note: 'start fast-helper command' },
+      'test-session',
+      config,
+    );
+
+    await invokeTool(
+      'exec-cancel',
+      { job_id: started.job_id, note: 'cancel with fast helper' },
+      'test-session',
+      config,
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const terminal = await invokeTool(
+      'exec-status',
+      { job_id: started.job_id, note: 'confirm fast helper cancellation' },
+      'test-session',
+      config,
+    );
+    expect(terminal.status).toBe('cancelled');
+    expect(terminal.completed_at).toBeDefined();
   });
 
   it.each(['channel', 'connection'] as const)(
