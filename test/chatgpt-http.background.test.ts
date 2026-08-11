@@ -221,7 +221,7 @@ describe('ChatGPT HTTP background command tools', () => {
       current = await invokeTool('exec-status', { job_id: started.job_id, note: 'poll cancelled job' }, 'test-session', config);
     }
 
-    expect(['cancelled', 'killed']).toContain(current.status);
+    expect(['cancelled', 'killed'], JSON.stringify(current)).toContain(current.status);
     expect(current.completed_at).toBeDefined();
 
     const afterTerminal = await invokeTool(
@@ -271,7 +271,7 @@ describe('ChatGPT HTTP background command tools', () => {
       current = await invokeTool('exec-status', { job_id: started.job_id, note: 'poll cancelled writer' }, 'test-session', config);
     }
 
-    expect(['cancelled', 'killed']).toContain(current.status);
+    expect(['cancelled', 'killed'], JSON.stringify(current)).toContain(current.status);
 
     await sleep(600);
     const firstSize = await invokeTool(
