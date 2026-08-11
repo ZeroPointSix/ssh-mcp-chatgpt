@@ -69,6 +69,7 @@ type CreationResult =
 interface InflightCreation {
   promise: Promise<CreationResult>;
   client: Client;
+  waiterCount: number;
   abort: () => void;
 }
 
@@ -142,24 +143,19 @@ export class SshConnectionPool {
 
       if (creation) {
         let result: CreationResult | undefined;
+        creation.waiterCount += 1;
         try {
-          // Shared waiters must observe the same handshake failure. TIMEOUT and
-          // ABORTED still reject only the timed-out waiter.
+          // Every waiter owns its deadline. A timeout or abort must not cancel
+          // the shared handshake while another waiter can still use it.
           result = await this.awaitWithDeadline(
             creation.promise,
             deadlineAt,
             timeoutMs,
             signal,
           );
-        } catch (error) {
-          if (
-            error instanceof SshConnectionAcquireError &&
-            (error.code === "TIMEOUT" || error.code === "ABORTED")
-          ) {
-            // Stop a hung handshake so the slot is not stuck forever.
-            creation.abort();
-          }
-          throw error;
+        } finally {
+          creation.waiterCount = Math.max(0, creation.waiterCount - 1);
+          if (creation.waiterCount === 0) creation.abort();
         }
         if (result && !result.ok) {
           throw result.error;
@@ -202,6 +198,8 @@ export class SshConnectionPool {
 
   closeAll(): void {
     clearInterval(this.idleTimer);
+    for (const creation of this.creating.values()) creation.abort();
+    this.creating.clear();
     for (const entries of this.entries.values()) {
       for (const entry of entries) this.destroyEntry(entry);
     }
@@ -280,7 +278,15 @@ export class SshConnectionPool {
       fail(error);
     });
     client.on("close", () => {
-      fail(new Error("SSH connection closed before ready"));
+      if (!settled) {
+        fail(new Error("SSH connection closed before ready"));
+        return;
+      }
+      // The transport is already closed. Detach it immediately without
+      // calling end() again, which can emit another close event.
+      entry.dead = true;
+      this.liveEntries(key);
+      this.wakeOne(key);
     });
     try {
       client.connect(config);
@@ -291,6 +297,7 @@ export class SshConnectionPool {
     return {
       promise,
       client,
+      waiterCount: 0,
       abort: () => {
         if (settled || aborted) return;
         aborted = true;
