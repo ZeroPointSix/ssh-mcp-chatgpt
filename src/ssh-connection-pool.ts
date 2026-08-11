@@ -70,6 +70,7 @@ interface InflightCreation {
   promise: Promise<CreationResult>;
   client: Client;
   abort: () => void;
+  waiters: number;
 }
 
 export class SshConnectionPool {
@@ -142,6 +143,8 @@ export class SshConnectionPool {
 
       if (creation) {
         let result: CreationResult | undefined;
+        let waiterExpired = false;
+        creation.waiters += 1;
         try {
           // Shared waiters must observe the same handshake failure. TIMEOUT and
           // ABORTED still reject only the timed-out waiter.
@@ -156,10 +159,14 @@ export class SshConnectionPool {
             error instanceof SshConnectionAcquireError &&
             (error.code === "TIMEOUT" || error.code === "ABORTED")
           ) {
-            // Stop a hung handshake so the slot is not stuck forever.
-            creation.abort();
+            waiterExpired = true;
           }
           throw error;
+        } finally {
+          creation.waiters = Math.max(0, creation.waiters - 1);
+          // A caller owns only its wait. Abort the shared handshake only when
+          // no other acquire can still use it.
+          if (waiterExpired && creation.waiters === 0) creation.abort();
         }
         if (result && !result.ok) {
           throw result.error;
@@ -291,6 +298,7 @@ export class SshConnectionPool {
     return {
       promise,
       client,
+      waiters: 0,
       abort: () => {
         if (settled || aborted) return;
         aborted = true;
