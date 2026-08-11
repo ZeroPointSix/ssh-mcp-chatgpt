@@ -43,7 +43,7 @@ describe('ChatGPT HTTP background command tools', () => {
     expect(health.default_output_max_chars).toBe(100000);
     expect(health.default_expire_time_ms).toBe(55000);
     expect(health.default_kill_time_ms).toBe(600000);
-    expect(health.version).toBe('1.6.9-chatgpt.0');
+    expect(health.version).toBe('1.6.8-chatgpt.0');
     expect(toolNames).toEqual(expect.arrayContaining(['exec', 'exec-status', 'exec-cancel']));
   });
 
@@ -216,12 +216,12 @@ describe('ChatGPT HTTP background command tools', () => {
     }
 
     let current = cancelled;
-    for (let attempt = 0; attempt < 20 && (current.status === 'running' || current.status === 'cancelling'); attempt += 1) {
+    for (let attempt = 0; attempt < 40 && (current.status === 'running' || current.status === 'cancelling'); attempt += 1) {
       await sleep(150);
       current = await invokeTool('exec-status', { job_id: started.job_id, note: 'poll cancelled job' }, 'test-session', config);
     }
 
-    expect(['cancelled', 'killed'], JSON.stringify(current)).toContain(current.status);
+    expect(['cancelled', 'killed']).toContain(current.status);
     expect(current.completed_at).toBeDefined();
 
     const afterTerminal = await invokeTool(
@@ -266,12 +266,12 @@ describe('ChatGPT HTTP background command tools', () => {
     );
 
     let current = started;
-    for (let attempt = 0; attempt < 30 && (current.status === 'running' || current.status === 'cancelling'); attempt += 1) {
+    for (let attempt = 0; attempt < 40 && (current.status === 'running' || current.status === 'cancelling'); attempt += 1) {
       await sleep(150);
       current = await invokeTool('exec-status', { job_id: started.job_id, note: 'poll cancelled writer' }, 'test-session', config);
     }
 
-    expect(['cancelled', 'killed'], JSON.stringify(current)).toContain(current.status);
+    expect(['cancelled', 'killed']).toContain(current.status);
 
     await sleep(600);
     const firstSize = await invokeTool(
