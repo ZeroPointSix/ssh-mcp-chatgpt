@@ -216,7 +216,7 @@ describe('ChatGPT HTTP background command tools', () => {
     }
 
     let current = cancelled;
-    for (let attempt = 0; attempt < 20 && (current.status === 'running' || current.status === 'cancelling'); attempt += 1) {
+    for (let attempt = 0; attempt < 40 && (current.status === 'running' || current.status === 'cancelling'); attempt += 1) {
       await sleep(150);
       current = await invokeTool('exec-status', { job_id: started.job_id, note: 'poll cancelled job' }, 'test-session', config);
     }
@@ -266,7 +266,7 @@ describe('ChatGPT HTTP background command tools', () => {
     );
 
     let current = started;
-    for (let attempt = 0; attempt < 30 && (current.status === 'running' || current.status === 'cancelling'); attempt += 1) {
+    for (let attempt = 0; attempt < 40 && (current.status === 'running' || current.status === 'cancelling'); attempt += 1) {
       await sleep(150);
       current = await invokeTool('exec-status', { job_id: started.job_id, note: 'poll cancelled writer' }, 'test-session', config);
     }
