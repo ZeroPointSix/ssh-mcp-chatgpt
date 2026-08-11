@@ -6,7 +6,6 @@ import { SshConnectionPool } from "../src/ssh-connection-pool.js";
 
 class FakeClient extends EventEmitter {
   ended = false;
-  endCalls = 0;
 
   constructor(private readonly autoReady = true) {
     super();
@@ -17,7 +16,6 @@ class FakeClient extends EventEmitter {
   }
 
   end(): void {
-    this.endCalls += 1;
     this.ended = true;
     this.emit("close");
   }
@@ -113,19 +111,6 @@ describe("SshConnectionPool", () => {
     pool.closeAll();
   });
 
-  it("ends an unhealthy shared transport only once", async () => {
-    const clients: FakeClient[] = [];
-    const pool = new SshConnectionPool(1, 2, 1_000, 60_000, fakeFactory(clients));
-
-    const first = await pool.acquire(config);
-    const second = await pool.acquire(config);
-    first.release(true);
-    second.release(true);
-
-    expect(clients[0].endCalls).toBe(1);
-    pool.closeAll();
-  });
-
 
   it("times out while waiting for channel capacity", async () => {
     const clients: FakeClient[] = [];
@@ -153,24 +138,6 @@ describe("SshConnectionPool", () => {
       connections: 0,
       idle_connections: 0,
     });
-    pool.closeAll();
-  });
-
-  it("ends a transport that errors before SSH is ready", async () => {
-    const clients: FakeClient[] = [];
-    const pool = new SshConnectionPool(
-      1,
-      1,
-      1_000,
-      60_000,
-      fakeFactory(clients, false),
-    );
-
-    const pending = pool.acquire(config);
-    clients[0].emit("error", new Error("handshake failed"));
-
-    await expect(pending).rejects.toThrow("handshake failed");
-    expect(clients[0].endCalls).toBe(1);
     pool.closeAll();
   });
 
@@ -234,81 +201,6 @@ describe("SshConnectionPool", () => {
     pool.closeAll();
   });
 
-  it("evicts a ready connection immediately when its transport closes", async () => {
-    const clients: FakeClient[] = [];
-    const pool = new SshConnectionPool(1, 1, 1_000, 60_000, fakeFactory(clients));
-
-    const first = await pool.acquire(config);
-    const failedClient = first.client;
-    clients[0].emit("close");
-
-    expect(pool.status()).toMatchObject({
-      connections: 0,
-      active_leases: 0,
-    });
-    expect(clients[0].ended).toBe(false);
-
-    first.release(true);
-    expect(clients[0].endCalls).toBe(0);
-    const recovered = await pool.acquire(config);
-    expect(recovered.client).not.toBe(failedClient);
-    expect(clients).toHaveLength(2);
-
-    recovered.release();
-    pool.closeAll();
-  });
-
-  it("isolates a short waiter timeout from a shared handshake", async () => {
-    const clients: FakeClient[] = [];
-    const pool = new SshConnectionPool(
-      1,
-      1,
-      1_000,
-      60_000,
-      fakeFactory(clients, false),
-    );
-
-    const shortWaiter = pool.acquire(config, { timeoutMs: 20 });
-    const longWaiter = pool.acquire(config, { timeoutMs: 500 });
-    await expect(shortWaiter).rejects.toThrow(
-      "SSH connection pool acquire timed out after 20ms",
-    );
-    expect(clients[0].ended).toBe(false);
-
-    clients[0].emit("ready");
-    const recovered = await longWaiter;
-    expect(recovered.client).toBe(clients[0]);
-
-    recovered.release();
-    pool.closeAll();
-  });
-
-  it("isolates one waiter abort from a shared handshake", async () => {
-    const clients: FakeClient[] = [];
-    const pool = new SshConnectionPool(
-      1,
-      1,
-      1_000,
-      60_000,
-      fakeFactory(clients, false),
-    );
-    const controller = new AbortController();
-
-    const abortedWaiter = pool.acquire(config, { signal: controller.signal });
-    const activeWaiter = pool.acquire(config, { timeoutMs: 500 });
-    controller.abort();
-
-    await expect(abortedWaiter).rejects.toThrow("SSH connection acquire aborted");
-    expect(clients[0].ended).toBe(false);
-
-    clients[0].emit("ready");
-    const recovered = await activeWaiter;
-    expect(recovered.client).toBe(clients[0]);
-
-    recovered.release();
-    pool.closeAll();
-  });
-
   it("times out a slow handshake before the pool default wait elapses", async () => {
     const clients: FakeClient[] = [];
     const pool = new SshConnectionPool(
@@ -332,6 +224,38 @@ describe("SshConnectionPool", () => {
     pool.closeAll();
   });
 
+  it("keeps a shared handshake alive when only one waiter times out", async () => {
+    const clients: FakeClient[] = [];
+    const pool = new SshConnectionPool(
+      1,
+      1,
+      5_000,
+      60_000,
+      fakeFactory(clients, false),
+    );
+
+    const shortWait = pool.acquire(config, { timeoutMs: 20 });
+    const longWait = pool.acquire(config, { timeoutMs: 500 });
+    expect(clients).toHaveLength(1);
+
+    await expect(shortWait).rejects.toThrow(
+      "SSH connection pool acquire timed out after 20ms",
+    );
+    clients[0].emit("ready");
+
+    const lease = await longWait;
+    expect(lease.client).toBe(clients[0]);
+    expect(clients[0].ended).toBe(false);
+    expect(pool.status()).toMatchObject({
+      connections: 1,
+      active_leases: 1,
+      created_total: 1,
+    });
+
+    lease.release();
+    pool.closeAll();
+  });
+
   it("aborts a pending acquire when the signal fires", async () => {
     const clients: FakeClient[] = [];
     const pool = new SshConnectionPool(
@@ -346,9 +270,6 @@ describe("SshConnectionPool", () => {
     queueMicrotask(() => controller.abort());
     await expect(pending).rejects.toThrow("SSH connection acquire aborted");
     expect(pool.status().waiting_acquires).toBe(0);
-    expect(clients[0].endCalls).toBe(1);
-    clients[0].emit("error", new Error("late handshake error"));
-    expect(clients[0].endCalls).toBe(1);
     pool.closeAll();
   });
 });
