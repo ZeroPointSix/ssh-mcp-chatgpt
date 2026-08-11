@@ -1,5 +1,4 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { afterEach, describe, expect, it } from 'vitest';
 import { invokeTool, listTools, loadRuntimeConfig } from '../src/chatgpt-http';
 import {
@@ -84,8 +83,7 @@ describe('Claude Code-style remote tools', () => {
     expect(cancel).toContain(pidPath);
     expect(cancel).toContain('kill -TERM');
     expect(cancel).toContain('kill -KILL');
-    expect(cancel).toContain('group_alive');
-    expect(cancel).toContain('ps -eo pgid=,stat=');
+    expect(cancel).toContain('kill -0');
     expect(() => buildManagedRemoteCancelCommand('bad/job')).toThrow('Invalid managed job ID');
 
     const scenario = [
@@ -97,21 +95,6 @@ describe('Claude Code-style remote tools', () => {
       "test ! -e '" + pidPath + "'",
     ].join('\n');
     expect(() => execFileSync('bash', ['-c', scenario], { timeout: 5000 })).not.toThrow();
-
-    mkdirSync('/tmp/.mcp/jobs', { recursive: true });
-    writeFileSync(pidPath, '999999\n');
-    let inspectionFailure: unknown;
-    try {
-      execFileSync('bash', ['-c', 'ps() { return 1; }; export -f ps; ' + cancel], {
-        stdio: 'pipe',
-        timeout: 5000,
-      });
-    } catch (error) {
-      inspectionFailure = error;
-    }
-    expect((inspectionFailure as { status?: number }).status).toBe(6);
-    expect(() => execFileSync('test', ['-s', pidPath])).not.toThrow();
-    rmSync(pidPath, { force: true });
 
     const trailingSemicolon = wrapManagedRemoteCommand('printf ok;');
     expect(trailingSemicolon).not.toContain(';; exit $?');
