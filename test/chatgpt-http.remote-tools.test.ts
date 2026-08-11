@@ -83,7 +83,8 @@ describe('Claude Code-style remote tools', () => {
     expect(cancel).toContain(pidPath);
     expect(cancel).toContain('kill -TERM');
     expect(cancel).toContain('kill -KILL');
-    expect(cancel).toContain('kill -0');
+    expect(cancel).toContain('group_alive');
+    expect(cancel).toContain('ps -eo pgid=,stat=');
     expect(() => buildManagedRemoteCancelCommand('bad/job')).toThrow('Invalid managed job ID');
 
     const scenario = [
