@@ -1028,18 +1028,25 @@ function fallbackStopCommandChannel(job: CommandJob): void {
   }
 }
 
-function startRemoteCommandStop(job: CommandJob): void {
-  if (job.stopControlStarted || isTerminalJobStatus(job.status)) return;
-  job.stopControlStarted = true;
-
+function armCommandStopConfirmationTimer(job: CommandJob): void {
+  if (job.stopTimer || isTerminalJobStatus(job.status)) return;
   job.stopTimer = setTimeout(() => {
     if (isTerminalJobStatus(job.status)) return;
     fallbackStopCommandChannel(job);
-    const error = `Remote cancellation was not confirmed within ${COMMAND_STOP_CONFIRM_TIMEOUT_MS}ms`;
+    const error = job.execCallbackPending
+      ? `SSH exec request did not acknowledge cancellation within ${COMMAND_STOP_CONFIRM_TIMEOUT_MS}ms`
+      : `Remote cancellation was not confirmed within ${COMMAND_STOP_CONFIRM_TIMEOUT_MS}ms`;
+    if (job.execCallbackPending) job.connectionUnhealthy = true;
     recordCommandStopError(job, error);
     finishCommandJob(job, { status: "failed", error });
   }, COMMAND_STOP_CONFIRM_TIMEOUT_MS);
   job.stopTimer.unref?.();
+}
+
+function startRemoteCommandStop(job: CommandJob): void {
+  if (job.stopControlStarted || isTerminalJobStatus(job.status)) return;
+  job.stopControlStarted = true;
+  armCommandStopConfirmationTimer(job);
 
   const stopConnection = new Client();
   job.stopConnection = stopConnection;
@@ -1068,7 +1075,7 @@ function startRemoteCommandStop(job: CommandJob): void {
       stream.stderr.on("data", (data: Buffer) => {
         stderr = (stderr + data.toString()).slice(-2_000);
       });
-      stream.on("close", (code: number | null, signal: string | null) => {
+      const onStopExit = (code: number | null, signal: string | null) => {
         if (settled || isTerminalJobStatus(job.status)) return;
         if (code === 0 && !signal) {
           settled = true;
@@ -1078,8 +1085,11 @@ function startRemoteCommandStop(job: CommandJob): void {
         }
         const detail = stderr.trim() ? ": " + stderr.trim() : "";
         fail("Remote cancellation helper failed (" + formatSshExitStatus(code, signal) + ")" + detail);
-      });
-      // A fast helper can close synchronously when stdin ends. Subscribe first.
+      };
+      // OpenSSH sends exit-status before channel close. Either event confirms the
+      // helper result, and the settled guard makes the pair idempotent.
+      stream.on("exit", onStopExit);
+      stream.on("close", onStopExit);
       stream.end();
     });
   });
@@ -1115,6 +1125,7 @@ function requestStopCommandJob(job: CommandJob, status: CommandJobStopStatus, er
   if (job.execCallbackPending) {
     // The exec request may already be in flight, but its PID file is not guaranteed
     // to exist yet. The exec callback starts cancellation after the channel opens.
+    armCommandStopConfirmationTimer(job);
     notifyCommandJobWaiters(job);
     return true;
   }

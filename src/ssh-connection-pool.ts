@@ -266,6 +266,7 @@ export class SshConnectionPool {
       }
       settled = true;
       resolveCreation({ ok: false, error });
+      this.destroyEntry(entry);
       this.wakeOne(key);
     };
 
@@ -313,11 +314,7 @@ export class SshConnectionPool {
           ok: false,
           error: new Error("SSH connection handshake aborted"),
         });
-        try {
-          client.end();
-        } catch {
-          /* ignore */
-        }
+        this.destroyEntry(entry);
         this.wakeOne(key);
       },
     };

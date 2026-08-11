@@ -156,6 +156,24 @@ describe("SshConnectionPool", () => {
     pool.closeAll();
   });
 
+  it("ends a transport that errors before SSH is ready", async () => {
+    const clients: FakeClient[] = [];
+    const pool = new SshConnectionPool(
+      1,
+      1,
+      1_000,
+      60_000,
+      fakeFactory(clients, false),
+    );
+
+    const pending = pool.acquire(config);
+    clients[0].emit("error", new Error("handshake failed"));
+
+    await expect(pending).rejects.toThrow("handshake failed");
+    expect(clients[0].endCalls).toBe(1);
+    pool.closeAll();
+  });
+
   it("rejects when the transport closes before SSH is ready", async () => {
     const clients: FakeClient[] = [];
     const pool = new SshConnectionPool(
@@ -328,6 +346,9 @@ describe("SshConnectionPool", () => {
     queueMicrotask(() => controller.abort());
     await expect(pending).rejects.toThrow("SSH connection acquire aborted");
     expect(pool.status().waiting_acquires).toBe(0);
+    expect(clients[0].endCalls).toBe(1);
+    clients[0].emit("error", new Error("late handshake error"));
+    expect(clients[0].endCalls).toBe(1);
     pool.closeAll();
   });
 });
