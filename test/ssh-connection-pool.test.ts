@@ -224,6 +224,38 @@ describe("SshConnectionPool", () => {
     pool.closeAll();
   });
 
+  it("keeps a shared handshake alive when only one waiter times out", async () => {
+    const clients: FakeClient[] = [];
+    const pool = new SshConnectionPool(
+      1,
+      1,
+      5_000,
+      60_000,
+      fakeFactory(clients, false),
+    );
+
+    const shortWait = pool.acquire(config, { timeoutMs: 20 });
+    const longWait = pool.acquire(config, { timeoutMs: 500 });
+    expect(clients).toHaveLength(1);
+
+    await expect(shortWait).rejects.toThrow(
+      "SSH connection pool acquire timed out after 20ms",
+    );
+    clients[0].emit("ready");
+
+    const lease = await longWait;
+    expect(lease.client).toBe(clients[0]);
+    expect(clients[0].ended).toBe(false);
+    expect(pool.status()).toMatchObject({
+      connections: 1,
+      active_leases: 1,
+      created_total: 1,
+    });
+
+    lease.release();
+    pool.closeAll();
+  });
+
   it("aborts a pending acquire when the signal fires", async () => {
     const clients: FakeClient[] = [];
     const pool = new SshConnectionPool(
