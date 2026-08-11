@@ -213,6 +213,7 @@ describe("SshConnectionPool", () => {
       connections: 0,
       active_leases: 0,
     });
+    expect(clients[0].ended).toBe(false);
 
     first.release();
     const recovered = await pool.acquire(config);
