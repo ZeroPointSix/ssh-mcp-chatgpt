@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { afterEach, describe, expect, it } from 'vitest';
 import { invokeTool, listTools, loadRuntimeConfig } from '../src/chatgpt-http';
 import {
@@ -75,13 +76,42 @@ describe('Claude Code-style remote tools', () => {
     expect(wrapManagedRemoteCommand('echo hi')).toContain('kill -TERM -- "-$managed_pid"');
     expect(wrapManagedRemoteCommand('echo hi')).toContain('HUP');
 
-    const managed = wrapManagedRemoteCommand('sleep 60', { jobId: 'job-test_1' });
-    expect(managed).toContain('/tmp/.mcp/jobs/job-test_1.pid');
-    const cancel = buildManagedRemoteCancelCommand('job-test_1');
-    expect(cancel).toContain('/tmp/.mcp/jobs/job-test_1.pid');
+    const jobId = 'job-test_' + process.pid;
+    const pidPath = '/tmp/.mcp/jobs/' + jobId + '.pid';
+    const managed = wrapManagedRemoteCommand('sleep 60', { jobId });
+    expect(managed).toContain(pidPath);
+    const cancel = buildManagedRemoteCancelCommand(jobId);
+    expect(cancel).toContain(pidPath);
     expect(cancel).toContain('kill -TERM');
     expect(cancel).toContain('kill -KILL');
+    expect(cancel).toContain('group_alive');
+    expect(cancel).toContain('ps -eo pgid=,stat=');
     expect(() => buildManagedRemoteCancelCommand('bad/job')).toThrow('Invalid managed job ID');
+
+    const scenario = [
+      managed + ' &',
+      'wrapper_pid=$!',
+      "for attempt in 1 2 3 4 5 6 7 8 9 10; do [ -s '" + pidPath + "' ] && break; sleep 0.05; done",
+      cancel,
+      'wait "$wrapper_pid" || true',
+      "test ! -e '" + pidPath + "'",
+    ].join('\n');
+    expect(() => execFileSync('bash', ['-c', scenario], { timeout: 5000 })).not.toThrow();
+
+    mkdirSync('/tmp/.mcp/jobs', { recursive: true });
+    writeFileSync(pidPath, '999999\n');
+    let inspectionFailure: unknown;
+    try {
+      execFileSync('bash', ['-c', 'ps() { return 1; }; export -f ps; ' + cancel], {
+        stdio: 'pipe',
+        timeout: 5000,
+      });
+    } catch (error) {
+      inspectionFailure = error;
+    }
+    expect((inspectionFailure as { status?: number }).status).toBe(6);
+    expect(() => execFileSync('test', ['-s', pidPath])).not.toThrow();
+    rmSync(pidPath, { force: true });
 
     const trailingSemicolon = wrapManagedRemoteCommand('printf ok;');
     expect(trailingSemicolon).not.toContain(';; exit $?');
@@ -224,6 +254,43 @@ describe('Claude Code-style remote tools', () => {
       config,
     );
   }, 30000);
+
+
+  it('keeps concurrent pooled writes within the OpenSSH session limit', async () => {
+    configureSshTarget();
+    const config = loadRuntimeConfig();
+    const root = '/tmp/ssh-mcp-pool-' + Date.now();
+    const content = 'x'.repeat(256 * 1024);
+
+    try {
+      const results = await Promise.all(
+        Array.from({ length: 16 }, (_, index) =>
+          invokeTool(
+            'fs-write',
+            {
+              path: root + '/file-' + index + '.txt',
+              content,
+              create_dirs: true,
+              backup: false,
+              note: 'verify pooled SFTP concurrency',
+            },
+            'test-session',
+            config,
+          ),
+        ),
+      );
+
+      expect(results).toHaveLength(16);
+      expect(results.every((result) => result.bytes_written === content.length)).toBe(true);
+    } finally {
+      await invokeTool(
+        'exec',
+        { command: "rm -rf -- '" + root + "'", note: 'clean pooled write fixtures' },
+        'test-session',
+        config,
+      ).catch(() => undefined);
+    }
+  }, 60000);
 
   it('rejects oversized files before reading their content', async () => {
     configureSshTarget();
@@ -453,3 +520,4 @@ describe('12-case L1-L5 tool corpus', () => {
     );
   }, 20000);
 });
+

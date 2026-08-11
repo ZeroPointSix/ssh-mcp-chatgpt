@@ -1,7 +1,7 @@
 {
   "name": "ssh-mcp",
   "license": "MIT",
-  "version": "1.6.6",
+  "version": "1.6.9",
   "description": "SSH MCP server with stdio and ChatGPT-compatible remote HTTP/OAuth entrypoints.",
   "type": "module",
   "bin": {

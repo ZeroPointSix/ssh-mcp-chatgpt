@@ -3,6 +3,13 @@ import { invokeTool, loadRuntimeConfig } from '../src/chatgpt-http';
 
 const mockState = vi.hoisted(() => ({
   commands: [] as string[],
+  commandStream: undefined as any,
+  commandClient: undefined as any,
+  commandCallbackDelayMs: 0,
+  commandCallbackNever: false,
+  stopDelayMs: 0,
+  stopCloseOnEnd: false,
+  stopExitOnly: false,
 }));
 
 vi.mock('ssh2', async () => {
@@ -17,16 +24,34 @@ vi.mock('ssh2', async () => {
       mockState.commands.push(command);
       const stream = new EventEmitter() as any;
       stream.stderr = new EventEmitter();
-      stream.end = () => undefined;
+      stream.end = () => {
+        if (command.includes('kill -KILL --') && mockState.stopCloseOnEnd) {
+          stream.emit('close', 0, null);
+        }
+      };
       stream.signal = (_signal: string, signalCallback?: (error?: Error) => void) => {
         signalCallback?.(new Error('SSH signal requests are unsupported'));
       };
       stream.close = () => undefined;
 
-      queueMicrotask(() => {
+      const dispatchCallback = () => {
         callback(undefined, stream);
-        if (command.includes('kill -KILL --')) stream.emit('close', 0, null);
-      });
+        if (command.includes('kill -KILL --')) {
+          if (!mockState.stopCloseOnEnd) {
+            const event = mockState.stopExitOnly ? 'exit' : 'close';
+            setTimeout(() => stream.emit(event, 0, null), mockState.stopDelayMs);
+          }
+        } else {
+          mockState.commandStream = stream;
+          mockState.commandClient = this;
+        }
+      };
+      if (!command.includes('kill -KILL --') && mockState.commandCallbackNever) return;
+      if (!command.includes('kill -KILL --') && mockState.commandCallbackDelayMs > 0) {
+        setTimeout(dispatchCallback, mockState.commandCallbackDelayMs);
+      } else {
+        queueMicrotask(dispatchCallback);
+      }
     }
 
     end() {
@@ -50,6 +75,14 @@ function configureSshTarget() {
 
 afterEach(() => {
   mockState.commands.length = 0;
+  mockState.commandStream = undefined;
+  mockState.commandClient = undefined;
+  mockState.commandCallbackDelayMs = 0;
+  mockState.commandCallbackNever = false;
+  mockState.stopDelayMs = 0;
+  mockState.stopCloseOnEnd = false;
+  mockState.stopExitOnly = false;
+  vi.useRealTimers();
   for (const key of Object.keys(process.env)) {
     if (!(key in originalEnv)) delete process.env[key];
   }
@@ -105,4 +138,176 @@ describe('exec-cancel remote process-group control', () => {
     expect(mockState.commands[1]).toContain('kill -TERM');
     expect(mockState.commands[1]).toContain('kill -KILL');
   });
+
+  it('waits for the exec callback before starting the cancellation helper', async () => {
+    configureSshTarget();
+    mockState.commandCallbackDelayMs = 80;
+    const config = loadRuntimeConfig();
+    const started = await invokeTool(
+      'exec',
+      { command: 'sleep 60', expire_time_ms: 10, kill_time_ms: 60000, note: 'start delayed-open command' },
+      'test-session',
+      config,
+    );
+
+    const requested = await invokeTool(
+      'exec-cancel',
+      { job_id: started.job_id, note: 'cancel before channel opens' },
+      'test-session',
+      config,
+    );
+    expect(requested.status).toBe('cancelling');
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(mockState.commands).toHaveLength(1);
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const terminal = await invokeTool(
+      'exec-status',
+      { job_id: started.job_id, note: 'confirm delayed-open cancellation' },
+      'test-session',
+      config,
+    );
+    expect(terminal.status).toBe('cancelled');
+    expect(terminal.stop_error).toBeUndefined();
+    expect(mockState.commands).toHaveLength(2);
+  });
+
+  it('confirms cancellation from helper exit-status before channel close', async () => {
+    configureSshTarget();
+    mockState.stopExitOnly = true;
+    const config = loadRuntimeConfig();
+    const started = await invokeTool(
+      'exec',
+      { command: 'sleep 60', expire_time_ms: 10, kill_time_ms: 60000, note: 'start exit-only helper command' },
+      'test-session',
+      config,
+    );
+
+    await invokeTool(
+      'exec-cancel',
+      { job_id: started.job_id, note: 'cancel with exit-only helper' },
+      'test-session',
+      config,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const terminal = await invokeTool(
+      'exec-status',
+      { job_id: started.job_id, note: 'confirm exit-only helper cancellation' },
+      'test-session',
+      config,
+    );
+    expect(terminal.status).toBe('cancelled');
+    expect(terminal.completed_at).toBeDefined();
+  });
+
+  it('fails within the confirmation deadline when the exec callback never arrives', async () => {
+    configureSshTarget();
+    mockState.commandCallbackNever = true;
+    vi.useFakeTimers();
+    const config = loadRuntimeConfig();
+
+    const startedPromise = invokeTool(
+      'exec',
+      { command: 'sleep 60', expire_time_ms: 10, kill_time_ms: 60000, note: 'start missing-ack command' },
+      'test-session',
+      config,
+    );
+    await vi.advanceTimersByTimeAsync(11);
+    const started = await startedPromise;
+    const requested = await invokeTool(
+      'exec-cancel',
+      { job_id: started.job_id, note: 'cancel missing-ack command' },
+      'test-session',
+      config,
+    );
+    expect(requested.status).toBe('cancelling');
+
+    await vi.advanceTimersByTimeAsync(5_001);
+    const terminal = await invokeTool(
+      'exec-status',
+      { job_id: started.job_id, note: 'confirm missing-ack failure' },
+      'test-session',
+      config,
+    );
+    expect(terminal.status).toBe('failed');
+    expect(terminal.stop_error).toContain('did not acknowledge cancellation');
+  });
+
+  it('observes a helper that closes synchronously when stdin ends', async () => {
+    configureSshTarget();
+    mockState.stopCloseOnEnd = true;
+    const config = loadRuntimeConfig();
+    const started = await invokeTool(
+      'exec',
+      { command: 'sleep 60', expire_time_ms: 10, kill_time_ms: 60000, note: 'start fast-helper command' },
+      'test-session',
+      config,
+    );
+
+    await invokeTool(
+      'exec-cancel',
+      { job_id: started.job_id, note: 'cancel with fast helper' },
+      'test-session',
+      config,
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const terminal = await invokeTool(
+      'exec-status',
+      { job_id: started.job_id, note: 'confirm fast helper cancellation' },
+      'test-session',
+      config,
+    );
+    expect(terminal.status).toBe('cancelled');
+    expect(terminal.completed_at).toBeDefined();
+  });
+
+  it.each(['channel', 'connection'] as const)(
+    'waits for helper confirmation when the original %s closes first',
+    async (closedTransport) => {
+      configureSshTarget();
+      mockState.stopDelayMs = 60;
+      const config = loadRuntimeConfig();
+      const started = await invokeTool(
+        'exec',
+        { command: 'sleep 60', expire_time_ms: 10, kill_time_ms: 60000, note: 'start close-race command' },
+        'test-session',
+        config,
+      );
+
+      await invokeTool(
+        'exec-cancel',
+        { job_id: started.job_id, note: 'cancel close-race command' },
+        'test-session',
+        config,
+      );
+      if (closedTransport === 'channel') {
+        mockState.commandStream.emit('close', null, 'SIGTERM');
+      } else {
+        mockState.commandClient.emit('close');
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      const pending = await invokeTool(
+        'exec-status',
+        { job_id: started.job_id, note: 'check pending stop confirmation' },
+        'test-session',
+        config,
+      );
+      expect(pending.status).toBe('cancelling');
+      expect(pending.completed_at).toBeUndefined();
+
+      await new Promise((resolve) => setTimeout(resolve, 70));
+      const terminal = await invokeTool(
+        'exec-status',
+        { job_id: started.job_id, note: 'confirm close-race cancellation' },
+        'test-session',
+        config,
+      );
+      expect(terminal.status).toBe('cancelled');
+      expect(terminal.completed_at).toBeDefined();
+    },
+  );
 });

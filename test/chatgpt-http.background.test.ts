@@ -43,9 +43,34 @@ describe('ChatGPT HTTP background command tools', () => {
     expect(health.default_output_max_chars).toBe(100000);
     expect(health.default_expire_time_ms).toBe(55000);
     expect(health.default_kill_time_ms).toBe(600000);
-    expect(health.version).toBe('1.6.6-chatgpt.0');
+    expect(health.version).toBe('1.6.9-chatgpt.0');
     expect(toolNames).toEqual(expect.arrayContaining(['exec', 'exec-status', 'exec-cancel']));
   });
+
+
+  it('returns a redacted failed job when pooled SSH setup fails', async () => {
+    configureSshTarget();
+    process.env.SSH_MCP_PORT = '1';
+    const config = loadRuntimeConfig();
+
+    const result = await invokeTool(
+      'exec',
+      {
+        command: 'printf unreachable',
+        expire_time_ms: 5000,
+        note: 'verify redacted connection failure',
+      },
+      'test-session',
+      config,
+    );
+
+    expect(result.status).toBe('failed');
+    expect(result.job_id).toMatch(/^job-/);
+    expect(result.error).toContain('SSH connection error:');
+    expect(result.error).toContain('[redacted-target]');
+    expect(result.error).not.toContain('127.0.0.1');
+    expect(result.error).not.toContain(':1');
+  }, 10000);
 
   it('returns a running job_id after expire_time_ms and later exposes completion', async () => {
     configureSshTarget();
@@ -196,7 +221,7 @@ describe('ChatGPT HTTP background command tools', () => {
       current = await invokeTool('exec-status', { job_id: started.job_id, note: 'poll cancelled job' }, 'test-session', config);
     }
 
-    expect(['cancelled', 'killed']).toContain(current.status);
+    expect(['cancelled', 'killed'], JSON.stringify(current)).toContain(current.status);
     expect(current.completed_at).toBeDefined();
 
     const afterTerminal = await invokeTool(
@@ -246,7 +271,7 @@ describe('ChatGPT HTTP background command tools', () => {
       current = await invokeTool('exec-status', { job_id: started.job_id, note: 'poll cancelled writer' }, 'test-session', config);
     }
 
-    expect(['cancelled', 'killed']).toContain(current.status);
+    expect(['cancelled', 'killed'], JSON.stringify(current)).toContain(current.status);
 
     await sleep(600);
     const firstSize = await invokeTool(
@@ -272,3 +297,4 @@ describe('ChatGPT HTTP background command tools', () => {
     );
   }, 20000);
 });
+
