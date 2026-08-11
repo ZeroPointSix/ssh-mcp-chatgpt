@@ -1066,7 +1066,6 @@ function startRemoteCommandStop(job: CommandJob): void {
       stream.stderr.on("data", (data: Buffer) => {
         stderr = (stderr + data.toString()).slice(-2_000);
       });
-      stream.end();
       stream.on("close", (code: number | null, signal: string | null) => {
         if (settled || isTerminalJobStatus(job.status)) return;
         if (code === 0 && !signal) {
@@ -1078,6 +1077,8 @@ function startRemoteCommandStop(job: CommandJob): void {
         const detail = stderr.trim() ? ": " + stderr.trim() : "";
         fail("Remote cancellation helper failed (" + formatSshExitStatus(code, signal) + ")" + detail);
       });
+      // A fast helper can close synchronously when stdin ends. Subscribe first.
+      stream.end();
     });
   });
   stopConnection.once("error", (error: Error) => {
