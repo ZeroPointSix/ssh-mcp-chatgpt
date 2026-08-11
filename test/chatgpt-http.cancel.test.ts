@@ -3,6 +3,8 @@ import { invokeTool, loadRuntimeConfig } from '../src/chatgpt-http';
 
 const mockState = vi.hoisted(() => ({
   commands: [] as string[],
+  commandStream: undefined as any,
+  stopDelayMs: 0,
 }));
 
 vi.mock('ssh2', async () => {
@@ -25,7 +27,11 @@ vi.mock('ssh2', async () => {
 
       queueMicrotask(() => {
         callback(undefined, stream);
-        if (command.includes('kill -KILL --')) stream.emit('close', 0, null);
+        if (command.includes('kill -KILL --')) {
+          setTimeout(() => stream.emit('close', 0, null), mockState.stopDelayMs);
+        } else {
+          mockState.commandStream = stream;
+        }
       });
     }
 
@@ -50,6 +56,8 @@ function configureSshTarget() {
 
 afterEach(() => {
   mockState.commands.length = 0;
+  mockState.commandStream = undefined;
+  mockState.stopDelayMs = 0;
   for (const key of Object.keys(process.env)) {
     if (!(key in originalEnv)) delete process.env[key];
   }
@@ -104,5 +112,45 @@ describe('exec-cancel remote process-group control', () => {
     expect(mockState.commands[1]).toContain(started.job_id + '.pid');
     expect(mockState.commands[1]).toContain('kill -TERM');
     expect(mockState.commands[1]).toContain('kill -KILL');
+  });
+
+  it('waits for helper confirmation when the original channel closes first', async () => {
+    configureSshTarget();
+    mockState.stopDelayMs = 60;
+    const config = loadRuntimeConfig();
+    const started = await invokeTool(
+      'exec',
+      { command: 'sleep 60', expire_time_ms: 10, kill_time_ms: 60000, note: 'start close-race command' },
+      'test-session',
+      config,
+    );
+
+    await invokeTool(
+      'exec-cancel',
+      { job_id: started.job_id, note: 'cancel close-race command' },
+      'test-session',
+      config,
+    );
+    mockState.commandStream.emit('close', null, 'SIGTERM');
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const pending = await invokeTool(
+      'exec-status',
+      { job_id: started.job_id, note: 'check pending stop confirmation' },
+      'test-session',
+      config,
+    );
+    expect(pending.status).toBe('cancelling');
+    expect(pending.completed_at).toBeUndefined();
+
+    await new Promise((resolve) => setTimeout(resolve, 70));
+    const terminal = await invokeTool(
+      'exec-status',
+      { job_id: started.job_id, note: 'confirm close-race cancellation' },
+      'test-session',
+      config,
+    );
+    expect(terminal.status).toBe('cancelled');
+    expect(terminal.completed_at).toBeDefined();
   });
 });
