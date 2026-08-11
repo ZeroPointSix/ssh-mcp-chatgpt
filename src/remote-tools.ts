@@ -139,17 +139,18 @@ export function buildManagedRemoteCancelCommand(jobId: string): string {
     "IFS= read -r pid < \"$pid_file\" || exit 3",
     "case \"$pid\" in ''|*[!0-9]*) exit 4 ;; esac",
     "[ \"$pid\" -gt 1 ] || exit 4",
-    "group_alive() { ps -eo pgid=,stat= 2>/dev/null | awk -v pgid=\"$pid\" '$1 == pgid && $2 !~ /^Z/ { found=1 } END { exit found ? 0 : 1 }'; }",
-    "group_alive || finish_cancel",
+    "group_alive() { processes=$(ps -eo pgid=,stat= 2>/dev/null) || return 2; awk -v pgid=\"$pid\" '$1 == pgid && $2 !~ /^Z/ { found=1 } END { exit found ? 0 : 1 }' <<<\"$processes\"; }",
+    "confirm_stopped() { group_alive; state=$?; [ \"$state\" -eq 1 ] && finish_cancel; [ \"$state\" -eq 0 ] || exit 6; }",
+    "confirm_stopped",
     "kill -TERM -- \"-$pid\" 2>/dev/null || true",
     "attempt=0",
     "while group_alive && [ \"$attempt\" -lt 10 ]; do attempt=$((attempt + 1)); sleep 0.1; done",
-    "group_alive || finish_cancel",
+    "confirm_stopped",
     "kill -KILL -- \"-$pid\" 2>/dev/null || true",
     "attempt=0",
     "while group_alive && [ \"$attempt\" -lt 10 ]; do attempt=$((attempt + 1)); sleep 0.1; done",
-    "group_alive && exit 5",
-    "finish_cancel",
+    "confirm_stopped",
+    "exit 5",
   ].join("; ");
   return "bash -c " + quoteShell(inner);
 }

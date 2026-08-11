@@ -5,6 +5,7 @@ const mockState = vi.hoisted(() => ({
   commands: [] as string[],
   commandStream: undefined as any,
   commandClient: undefined as any,
+  commandCallbackDelayMs: 0,
   stopDelayMs: 0,
   stopCloseOnEnd: false,
 }));
@@ -31,7 +32,7 @@ vi.mock('ssh2', async () => {
       };
       stream.close = () => undefined;
 
-      queueMicrotask(() => {
+      const dispatchCallback = () => {
         callback(undefined, stream);
         if (command.includes('kill -KILL --')) {
           if (!mockState.stopCloseOnEnd) {
@@ -41,7 +42,12 @@ vi.mock('ssh2', async () => {
           mockState.commandStream = stream;
           mockState.commandClient = this;
         }
-      });
+      };
+      if (!command.includes('kill -KILL --') && mockState.commandCallbackDelayMs > 0) {
+        setTimeout(dispatchCallback, mockState.commandCallbackDelayMs);
+      } else {
+        queueMicrotask(dispatchCallback);
+      }
     }
 
     end() {
@@ -67,6 +73,7 @@ afterEach(() => {
   mockState.commands.length = 0;
   mockState.commandStream = undefined;
   mockState.commandClient = undefined;
+  mockState.commandCallbackDelayMs = 0;
   mockState.stopDelayMs = 0;
   mockState.stopCloseOnEnd = false;
   for (const key of Object.keys(process.env)) {
@@ -123,6 +130,40 @@ describe('exec-cancel remote process-group control', () => {
     expect(mockState.commands[1]).toContain(started.job_id + '.pid');
     expect(mockState.commands[1]).toContain('kill -TERM');
     expect(mockState.commands[1]).toContain('kill -KILL');
+  });
+
+  it('waits for the exec callback before starting the cancellation helper', async () => {
+    configureSshTarget();
+    mockState.commandCallbackDelayMs = 80;
+    const config = loadRuntimeConfig();
+    const started = await invokeTool(
+      'exec',
+      { command: 'sleep 60', expire_time_ms: 10, kill_time_ms: 60000, note: 'start delayed-open command' },
+      'test-session',
+      config,
+    );
+
+    const requested = await invokeTool(
+      'exec-cancel',
+      { job_id: started.job_id, note: 'cancel before channel opens' },
+      'test-session',
+      config,
+    );
+    expect(requested.status).toBe('cancelling');
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(mockState.commands).toHaveLength(1);
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const terminal = await invokeTool(
+      'exec-status',
+      { job_id: started.job_id, note: 'confirm delayed-open cancellation' },
+      'test-session',
+      config,
+    );
+    expect(terminal.status).toBe('cancelled');
+    expect(terminal.stop_error).toBeUndefined();
+    expect(mockState.commands).toHaveLength(2);
   });
 
   it('observes a helper that closes synchronously when stdin ends', async () => {

@@ -7,6 +7,8 @@ interface PoolEntry {
   activeLeases: number;
   lastUsedAt: number;
   dead: boolean;
+  transportClosed: boolean;
+  endStarted: boolean;
 }
 
 export interface SshConnectionLease {
@@ -245,6 +247,8 @@ export class SshConnectionPool {
       activeLeases: 0,
       lastUsedAt: Date.now(),
       dead: false,
+      transportClosed: false,
+      endStarted: false,
     };
 
     // Always resolve (never reject) so late handshake failures cannot surface as
@@ -278,6 +282,7 @@ export class SshConnectionPool {
       fail(error);
     });
     client.on("close", () => {
+      entry.transportClosed = true;
       if (!settled) {
         fail(new Error("SSH connection closed before ready"));
         return;
@@ -457,6 +462,8 @@ export class SshConnectionPool {
 
   private destroyEntry(entry: PoolEntry): void {
     entry.dead = true;
+    if (entry.transportClosed || entry.endStarted) return;
+    entry.endStarted = true;
     try {
       entry.client.end();
     } catch {

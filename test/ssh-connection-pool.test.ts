@@ -6,6 +6,7 @@ import { SshConnectionPool } from "../src/ssh-connection-pool.js";
 
 class FakeClient extends EventEmitter {
   ended = false;
+  endCalls = 0;
 
   constructor(private readonly autoReady = true) {
     super();
@@ -16,6 +17,7 @@ class FakeClient extends EventEmitter {
   }
 
   end(): void {
+    this.endCalls += 1;
     this.ended = true;
     this.emit("close");
   }
@@ -108,6 +110,19 @@ describe("SshConnectionPool", () => {
     });
 
     second.release();
+    pool.closeAll();
+  });
+
+  it("ends an unhealthy shared transport only once", async () => {
+    const clients: FakeClient[] = [];
+    const pool = new SshConnectionPool(1, 2, 1_000, 60_000, fakeFactory(clients));
+
+    const first = await pool.acquire(config);
+    const second = await pool.acquire(config);
+    first.release(true);
+    second.release(true);
+
+    expect(clients[0].endCalls).toBe(1);
     pool.closeAll();
   });
 
@@ -215,7 +230,8 @@ describe("SshConnectionPool", () => {
     });
     expect(clients[0].ended).toBe(false);
 
-    first.release();
+    first.release(true);
+    expect(clients[0].endCalls).toBe(0);
     const recovered = await pool.acquire(config);
     expect(recovered.client).not.toBe(failedClient);
     expect(clients).toHaveLength(2);

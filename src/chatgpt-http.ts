@@ -146,6 +146,7 @@ interface CommandJob {
   stopCommand: string;
   conn?: Client;
   stream?: ClientChannel;
+  execCallbackPending?: boolean;
   killTimer?: NodeJS.Timeout;
   stopTimer?: NodeJS.Timeout;
   stopConnection?: Client;
@@ -955,6 +956,7 @@ function finishCommandJob(job: CommandJob, updates: Partial<CommandJob>): void {
   job.releaseConnection?.(job.connectionUnhealthy);
   try { job.stopConnection?.end(); } catch { /* ignore */ }
   job.stream = undefined;
+  job.execCallbackPending = false;
   job.conn = undefined;
   job.releaseConnection = undefined;
   job.onConnectionError = undefined;
@@ -1104,10 +1106,16 @@ function requestStopCommandJob(job: CommandJob, status: CommandJobStopStatus, er
     /* ignore */
   }
 
-  if (!job.startedAt && !job.stream) {
-    try { job.conn?.end(); } catch { /* ignore */ }
-    // Still acquiring or not yet started: stop immediately without remote cancel helper.
+  if (!job.startedAt && !job.execCallbackPending && !job.stream) {
+    // Still acquiring: no remote command can have started.
     finalizeStoppedCommandJob(job);
+    return true;
+  }
+
+  if (job.execCallbackPending) {
+    // The exec request may already be in flight, but its PID file is not guaranteed
+    // to exist yet. The exec callback starts cancellation after the channel opens.
+    notifyCommandJobWaiters(job);
     return true;
   }
 
@@ -1124,7 +1132,7 @@ function beginSshCommandExecution(
 ): void {
   if (isTerminalJobStatus(job.status) || job.stopRequestedStatus) {
     try {
-      lease.release(true);
+      lease.release();
     } catch {
       /* ignore */
     }
@@ -1144,13 +1152,28 @@ function beginSshCommandExecution(
 
   job.onConnectionError = (err: Error) => {
     job.connectionUnhealthy = true;
-    failCommandJob(job, `SSH connection error: ${redactSshConnectionError(err.message)}`);
+    const error = `SSH connection error: ${redactSshConnectionError(err.message)}`;
+    if (job.stopRequestedStatus && job.execCallbackPending) {
+      recordCommandStopError(job, error);
+      finishCommandJob(job, {
+        status: "failed",
+        error: "SSH connection failed before cancellation could be confirmed",
+      });
+      return;
+    }
+    failCommandJob(job, error);
   };
   job.onConnectionClose = () => {
     job.connectionUnhealthy = true;
     if (isTerminalJobStatus(job.status)) return;
     if (job.stopRequestedStatus) {
-      if (!job.stopControlStarted) finalizeStoppedCommandJob(job);
+      if (job.execCallbackPending) {
+        const error = "SSH connection closed before cancellation could be confirmed";
+        recordCommandStopError(job, error);
+        finishCommandJob(job, { status: "failed", error });
+      } else if (!job.stopControlStarted) {
+        finalizeStoppedCommandJob(job);
+      }
       return;
     }
     if (job.status === "running") {
@@ -1166,7 +1189,15 @@ function beginSshCommandExecution(
   conn.on("close", job.onConnectionClose);
 
   job.startedAt = Date.now();
+  job.execCallbackPending = true;
   conn.exec(managedCommand, (err: Error | undefined, stream: ClientChannel) => {
+    job.execCallbackPending = false;
+    if (isTerminalJobStatus(job.status)) {
+      if (!err) {
+        try { stream.close(); } catch { /* ignore */ }
+      }
+      return;
+    }
     if (err) {
       failCommandJob(
         job,
@@ -1175,15 +1206,12 @@ function beginSshCommandExecution(
       return;
     }
     job.stream = stream;
-    if (job.stopRequestedStatus) startRemoteCommandStop(job);
     stream.on("data", (data: Buffer) => {
       appendCommandJobOutput(job, "stdout", data);
     });
     stream.stderr.on("data", (data: Buffer) => {
       appendCommandJobOutput(job, "stderr", data);
     });
-    if (stdin === undefined) stream.end();
-    else stream.end(stdin);
     stream.on("close", (code: number | null, signal: string | null) => {
       if (isTerminalJobStatus(job.status)) return;
       job.exitCode = code;
@@ -1194,6 +1222,9 @@ function beginSshCommandExecution(
       }
       finishCommandJob(job, { status: "completed" });
     });
+    if (job.stopRequestedStatus) startRemoteCommandStop(job);
+    if (stdin === undefined) stream.end();
+    else stream.end(stdin);
   });
 }
 
@@ -1266,7 +1297,7 @@ function startSshCommandJob(
       });
       if (isTerminalJobStatus(job.status) || job.stopRequestedStatus) {
         try {
-          lease.release(true);
+          lease.release();
         } catch {
           /* ignore */
         }
