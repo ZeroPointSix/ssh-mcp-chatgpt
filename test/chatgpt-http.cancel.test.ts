@@ -382,4 +382,37 @@ describe('exec-cancel remote process-group control', () => {
     expect(terminal.exit_code).toBe(0);
     expect(terminal.stdout).toBe('');
   });
+
+  it('cancels the remote process group when the client aborts mid-wait', async () => {
+    configureSshTarget();
+    mockState.stopCloseOnEnd = true;
+    const config = loadRuntimeConfig();
+    const abort = new AbortController();
+
+    const startedPromise = invokeTool(
+      'exec',
+      {
+        command: 'sleep 60',
+        expire_time_ms: 60000,
+        kill_time_ms: 60000,
+        note: 'client disconnect cancel',
+      },
+      'test-session',
+      config,
+      abort.signal,
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    abort.abort();
+    const result = await startedPromise;
+
+    expect(['cancelling', 'cancelled', 'kill_requested', 'killed']).toContain(
+      result.status,
+    );
+    expect(
+      mockState.commands.some(
+        (command) => command.includes('kill -TERM') || command.includes('kill -KILL'),
+      ),
+    ).toBe(true);
+  });
 });
