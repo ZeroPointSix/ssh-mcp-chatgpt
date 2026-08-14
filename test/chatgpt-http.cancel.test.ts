@@ -310,4 +310,76 @@ describe('exec-cancel remote process-group control', () => {
       expect(terminal.completed_at).toBeDefined();
     },
   );
+
+  it('returns status-only and incremental exec-status payloads', async () => {
+    configureSshTarget();
+    const config = loadRuntimeConfig();
+    const started = await invokeTool(
+      'exec',
+      { command: 'sleep 60', expire_time_ms: 10, kill_time_ms: 60000, note: 'start incremental status command' },
+      'test-session',
+      config,
+    );
+    expect(started.status).toBe('running');
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    mockState.commandStream.emit('data', Buffer.from('part-one'));
+
+    const statusOnly = await invokeTool(
+      'exec-status',
+      { job_id: started.job_id, include_output: false, note: 'status-only poll' },
+      'test-session',
+      config,
+    );
+    expect(statusOnly.status).toBe('running');
+    expect(statusOnly.stdout).toBe('');
+    expect(statusOnly.include_output).toBe(false);
+    expect(statusOnly.next_stdout_offset).toBe(8);
+
+    const first = await invokeTool(
+      'exec-status',
+      {
+        job_id: started.job_id,
+        include_output: true,
+        since_stdout_offset: 0,
+        note: 'first incremental poll',
+      },
+      'test-session',
+      config,
+    );
+    expect(first.stdout).toBe('part-one');
+    expect(first.since_stdout_offset).toBe(0);
+    expect(first.next_stdout_offset).toBe(8);
+
+    mockState.commandStream.emit('data', Buffer.from('part-two'));
+    const second = await invokeTool(
+      'exec-status',
+      {
+        job_id: started.job_id,
+        include_output: true,
+        since_stdout_offset: first.next_stdout_offset,
+        note: 'second incremental poll',
+      },
+      'test-session',
+      config,
+    );
+    expect(second.stdout).toBe('part-two');
+    expect(second.since_stdout_offset).toBe(8);
+    expect(second.next_stdout_offset).toBe(16);
+
+    mockState.commandStream.emit('close', 0, null);
+    const terminal = await invokeTool(
+      'exec-status',
+      {
+        job_id: started.job_id,
+        include_output: false,
+        note: 'final status-only poll',
+      },
+      'test-session',
+      config,
+    );
+    expect(terminal.status).toBe('completed');
+    expect(terminal.exit_code).toBe(0);
+    expect(terminal.stdout).toBe('');
+  });
 });
