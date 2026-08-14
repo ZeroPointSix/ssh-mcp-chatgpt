@@ -895,21 +895,45 @@ function appendCommandJobOutput(job: CommandJob, streamName: "stdout" | "stderr"
   job.stderr += chunk;
 }
 
-function commandJobPayload(job: CommandJob): JsonObject {
+interface CommandJobPayloadOptions {
+  includeOutput?: boolean;
+  sinceStdoutOffset?: number;
+  sinceStderrOffset?: number;
+}
+
+function clampOffset(offset: number | undefined, length: number): number {
+  if (offset === undefined) return 0;
+  if (!Number.isInteger(offset) || offset < 0) {
+    throw new AppError(400, "output offsets must be non-negative integers", "INVALID_PARAMS");
+  }
+  return Math.min(offset, length);
+}
+
+function commandJobPayload(job: CommandJob, options: CommandJobPayloadOptions = {}): JsonObject {
   const now = Date.now();
   const completedAt = job.completedAt;
+  const includeOutput = options.includeOutput !== false;
+  const stdoutOffset = clampOffset(options.sinceStdoutOffset, job.stdout.length);
+  const stderrOffset = clampOffset(options.sinceStderrOffset, job.stderr.length);
+  const stdoutDelta = includeOutput ? job.stdout.slice(stdoutOffset) : "";
+  const stderrDelta = includeOutput ? job.stderr.slice(stderrOffset) : "";
   const payload: JsonObject = {
     status: job.status,
     tool: job.tool,
     target_id: job.targetId,
     target_label: job.targetLabel,
     job_id: job.id,
-    stdout: job.stdout,
-    stderr: job.stderr,
+    stdout: stdoutDelta,
+    stderr: stderrDelta,
     stdout_truncated: job.stdoutTruncated,
     stderr_truncated: job.stderrTruncated,
     stdout_total_chars: job.stdoutChars,
     stderr_total_chars: job.stderrChars,
+    retained_stdout_chars: job.stdout.length,
+    retained_stderr_chars: job.stderr.length,
+    next_stdout_offset: job.stdout.length,
+    next_stderr_offset: job.stderr.length,
+    include_output: includeOutput,
     output_max_chars: outputLimitPayload(job.outputMaxChars),
     command_length: job.commandLength,
     elapsed_ms: (completedAt ?? now) - job.createdAt,
@@ -917,6 +941,10 @@ function commandJobPayload(job: CommandJob): JsonObject {
     expire_time_ms: job.expireTimeMs,
     kill_time_ms: job.killTimeMs ?? "none",
   };
+  if (includeOutput) {
+    payload.since_stdout_offset = stdoutOffset;
+    payload.since_stderr_offset = stderrOffset;
+  }
   if (job.startedAt) payload.started_at = new Date(job.startedAt).toISOString();
   if (job.stopRequestedAt) payload.stop_requested_at = new Date(job.stopRequestedAt).toISOString();
   if (job.stopRequestedStatus) payload.stop_requested_status = job.stopRequestedStatus;
@@ -1581,7 +1609,20 @@ function getCommandJob(args: JsonObject): CommandJob {
 
 function runCommandStatusTool(args: JsonObject): JsonObject {
   cleanupCommandJobs();
-  return commandJobPayload(getCommandJob(args));
+  const includeOutput = optionalBoolean(args.include_output, "include_output");
+  const sinceStdoutOffset = optionalInteger(args.since_stdout_offset, "since_stdout_offset");
+  const sinceStderrOffset = optionalInteger(args.since_stderr_offset, "since_stderr_offset");
+  if (sinceStdoutOffset !== undefined && sinceStdoutOffset < 0) {
+    throw new AppError(400, "since_stdout_offset must be a non-negative integer", "INVALID_PARAMS");
+  }
+  if (sinceStderrOffset !== undefined && sinceStderrOffset < 0) {
+    throw new AppError(400, "since_stderr_offset must be a non-negative integer", "INVALID_PARAMS");
+  }
+  return commandJobPayload(getCommandJob(args), {
+    includeOutput,
+    sinceStdoutOffset,
+    sinceStderrOffset,
+  });
 }
 
 function runCommandCancelTool(args: JsonObject): JsonObject {
@@ -1776,6 +1817,13 @@ const COMMAND_OUTPUT_SCHEMA: JsonObject = {
     stderr_truncated: { type: "boolean" },
     stdout_total_chars: { type: "number" },
     stderr_total_chars: { type: "number" },
+    retained_stdout_chars: { type: "number" },
+    retained_stderr_chars: { type: "number" },
+    next_stdout_offset: { type: "number" },
+    next_stderr_offset: { type: "number" },
+    since_stdout_offset: { type: "number" },
+    since_stderr_offset: { type: "number" },
+    include_output: { type: "boolean" },
     output_max_chars: { anyOf: [{ type: "number" }, { type: "string", enum: ["none"] }] },
     command_length: { type: "number" },
     elapsed_ms: { type: "number" },
@@ -1979,9 +2027,24 @@ function listTools(config: RuntimeConfig): JsonObject[] {
     withSecurity(
       {
         name: "exec-status",
-        description: "Fetch stdout, stderr, exit status, and progress for a background exec, sudo-exec, or run-script job_id.",
+        description:
+          "Fetch exit status and progress for a background exec, sudo-exec, or run-script job_id. Defaults return retained stdout/stderr. Pass include_output=false for a cheap status-only poll. Pass since_stdout_offset/since_stderr_offset (retained-buffer char offsets from the previous next_*_offset) to fetch only new output and avoid OUTPUT_TRUNCATED on repeated polls.",
         inputSchema: schema(
-          { job_id: { type: "string", minLength: 1, description: "Background command job_id returned by exec, sudo-exec, or run-script." } },
+          {
+            job_id: { type: "string", minLength: 1, description: "Background command job_id returned by exec, sudo-exec, or run-script." },
+            include_output: {
+              type: "boolean",
+              description: "When false, omit stdout/stderr bodies and only return status metadata plus next offsets. Defaults to true for compatibility.",
+            },
+            since_stdout_offset: {
+              type: "number",
+              description: "Char offset into the retained stdout buffer. Use the previous response next_stdout_offset. Values beyond the retained buffer are clamped.",
+            },
+            since_stderr_offset: {
+              type: "number",
+              description: "Char offset into the retained stderr buffer. Use the previous response next_stderr_offset. Values beyond the retained buffer are clamped.",
+            },
+          },
           ["job_id"],
         ),
         outputSchema: COMMAND_OUTPUT_SCHEMA,

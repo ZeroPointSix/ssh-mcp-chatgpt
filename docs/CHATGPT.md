@@ -223,7 +223,7 @@ curl -sS https://<your-domain>/mcp \
 - Pass `target_id` to `exec` and `sudo-exec` when choosing a non-default profile. If the deployment has no default profile, `target_id` is required.
 - Prefer short, inspectable commands.
 - Use `exec` by default.
-- If `exec` returns `status: "running"`, keep the returned `job_id` and poll with `exec-status` until it reaches `completed`, `failed`, `killed`, or `cancelled`. If the status is `cancelling` or `kill_requested`, the stop was requested but the SSH channel has not yet confirmed the final terminal status.
+- If `exec` returns `status: "running"`, keep the returned `job_id` and poll with `exec-status` until it reaches `completed`, `failed`, `killed`, or `cancelled`. Prefer `include_output=false` until you need output. When reading output repeatedly, pass the previous `next_stdout_offset` / `next_stderr_offset` as `since_stdout_offset` / `since_stderr_offset` so each poll returns only the delta. If the status is `cancelling` or `kill_requested`, the stop was requested but the SSH channel has not yet confirmed the final terminal status.
 - Use `exec-cancel` when a still-running background job should be stopped before its configured `kill_time_ms`, then keep polling with `exec-status`.
 - Large stdout/stderr are retained as a bounded tail controlled by `SSH_MCP_EXEC_OUTPUT_MAX_CHARS`; check `stdout_truncated` and `stderr_truncated` in tool output.
 - Use `sudo-exec` only when the deployment has explicitly enabled it, the selected profile allows sudo, and the task requires privilege.

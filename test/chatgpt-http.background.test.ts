@@ -99,6 +99,67 @@ describe('ChatGPT HTTP background command tools', () => {
     expect(current.exit_code).toBe(0);
   }, 10000);
 
+  it('supports status-only and incremental exec-status polls', async () => {
+    configureSshTarget();
+    const config = loadRuntimeConfig();
+
+    const started = await invokeTool(
+      'exec',
+      {
+        command: 'sh -c "printf part-one; sleep 1; printf part-two"',
+        expire_time_ms: 50,
+        kill_time_ms: 5000,
+        note: 'test incremental status polling',
+      },
+      'test-session',
+      config,
+    );
+
+    expect(started.status).toBe('running');
+    expect(started.job_id).toMatch(/^job-/);
+
+    let current = started;
+    let offset = 0;
+    let combined = '';
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      await sleep(120);
+      const statusOnly = await invokeTool(
+        'exec-status',
+        {
+          job_id: started.job_id,
+          include_output: false,
+          note: 'cheap status poll',
+        },
+        'test-session',
+        config,
+      );
+      expect(statusOnly.stdout).toBe('');
+      expect(statusOnly.include_output).toBe(false);
+      expect(typeof statusOnly.next_stdout_offset).toBe('number');
+
+      current = await invokeTool(
+        'exec-status',
+        {
+          job_id: started.job_id,
+          include_output: true,
+          since_stdout_offset: offset,
+          note: 'incremental output poll',
+        },
+        'test-session',
+        config,
+      );
+      expect(current.since_stdout_offset).toBe(offset);
+      combined += String(current.stdout ?? '');
+      offset = Number(current.next_stdout_offset);
+      if (current.status === 'completed') break;
+    }
+
+    expect(current.status).toBe('completed');
+    expect(current.exit_code).toBe(0);
+    expect(combined).toContain('part-one');
+    expect(combined).toContain('part-two');
+  }, 15000);
+
   it('closes stdin and reports non-zero exits as completed command results', async () => {
     configureSshTarget();
     const config = loadRuntimeConfig();
