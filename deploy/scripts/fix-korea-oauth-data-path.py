@@ -79,7 +79,7 @@ echo "$PW" | sudo -S docker run -d --restart unless-stopped --name {KOREA_SSH_MC
   --env-file {ENV_PATH} \\
   -v /opt/ssh-mcp-chatgpt-korea/profiles.json:/run/secrets/ssh-mcp-profiles.json:ro \\
   -v {MOUNTED_DATA}:{MOUNTED_DATA} \\
-  guangshanshui/ssh-mcp-chatgpt:pr8-4d4f
+  ghcr.io/zeropointsix/ssh-mcp-chatgpt:1.6.6-chatgpt.0
 sleep 6
 echo '=== container oauth file ==='
 echo "$PW" | sudo -S docker exec {KOREA_SSH_MCP_CONTAINER} cat {MOUNTED_DATA}/oauth-clients.json
@@ -137,7 +137,7 @@ echo "$PW" | sudo -S docker run -d --restart unless-stopped --name {KOREA_SSH_MC
   --env-file {ENV_PATH} \\
   -v /opt/ssh-mcp-chatgpt-korea/profiles.json:/run/secrets/ssh-mcp-profiles.json:ro \\
   -v {MOUNTED_DATA}:{MOUNTED_DATA} \\
-  guangshanshui/ssh-mcp-chatgpt:pr8-4d4f
+  ghcr.io/zeropointsix/ssh-mcp-chatgpt:1.6.6-chatgpt.0
 sleep 6
 echo "$PW" | sudo -S docker exec {KOREA_SSH_MCP_CONTAINER} cat {MOUNTED_DATA}/oauth-clients.json
 curl -sS -m 15 'https://ssh.zerodotsix.top/authorize?response_type=code&client_id={CLIENT_ID}&redirect_uri=https%3A%2F%2Fchatgpt.com%2Fconnector%2Foauth%2FiRoKHas_k7MG&scope=mcp&code_challenge=AxgXa4f1fzHdEpxqN1AF2VP7xk58iGZkZPEbn7XbVo8&code_challenge_method=S256&resource=https%3A%2F%2Fssh.zerodotsix.top&state=test' | grep -oE '缺少 OAuth|name=.secret|登录' | head -5
