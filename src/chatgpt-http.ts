@@ -29,7 +29,7 @@ type JsonRpcId = string | number | null;
 type JsonObject = Record<string, unknown>;
 
 const SERVER_NAME = "ssh-mcp-chatgpt";
-const SERVER_VERSION = "1.6.9-chatgpt.0";
+const SERVER_VERSION = "1.6.10-chatgpt.0";
 const STREAMABLE_HTTP_ACCEPT = "application/json, text/event-stream";
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const CODE_TTL_MS = 5 * 60 * 1000;
@@ -1365,19 +1365,47 @@ function startSshCommandJob(
   return job;
 }
 
-function waitForCommandJob(job: CommandJob, expireTimeMs: number): Promise<CommandJob> {
+function waitForCommandJob(
+  job: CommandJob,
+  expireTimeMs: number,
+  signal?: AbortSignal,
+): Promise<CommandJob> {
   if (isTerminalJobStatus(job.status)) return Promise.resolve(job);
+  if (signal?.aborted) {
+    requestStopCommandJob(
+      job,
+      "cancelled",
+      "Client disconnected before the command finished",
+    );
+    return Promise.resolve(job);
+  }
   return new Promise((resolve) => {
-    const onDone = () => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timeout);
+      job.waiters.delete(onDone);
+      signal?.removeEventListener("abort", onAbort);
       resolve(job);
     };
+    const onDone = () => finish();
+    const onAbort = () => {
+      requestStopCommandJob(
+        job,
+        "cancelled",
+        "Client disconnected before the command finished",
+      );
+      // Return the current job snapshot so the HTTP handler can exit; the
+      // remote cancel helper continues independently until confirmed.
+      finish();
+    };
     const timeout = setTimeout(() => {
-      job.waiters.delete(onDone);
-      resolve(job);
+      finish();
     }, expireTimeMs);
     timeout.unref?.();
     job.waiters.add(onDone);
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 
@@ -1469,7 +1497,13 @@ function wrapSudoRemoteCommand(command: string, sudoPassword?: string): string {
   return `sudo -n sh -c '${quotedCommand}'`;
 }
 
-async function runSshTool(name: "exec" | "sudo-exec", args: JsonObject, config: RuntimeConfig, target: ResolvedSshTarget): Promise<JsonObject> {
+async function runSshTool(
+  name: "exec" | "sudo-exec",
+  args: JsonObject,
+  config: RuntimeConfig,
+  target: ResolvedSshTarget,
+  signal?: AbortSignal,
+): Promise<JsonObject> {
   const command = sanitizeCommand(requireString(args.command, "command"), config.maxChars);
   const expireTimeMs = parseDurationArg(args.expire_time_ms, config.execExpireTimeMs, "expire_time_ms") ?? config.execExpireTimeMs;
   const killTimeMs = parseDurationArg(args.kill_time_ms, config.execKillTimeMs, "kill_time_ms");
@@ -1501,7 +1535,7 @@ async function runSshTool(name: "exec" | "sudo-exec", args: JsonObject, config: 
       ? (jobId) => wrapSudoRemoteCommand(buildManagedRemoteCancelCommand(jobId), config.sudoPassword)
       : undefined,
   );
-  await waitForCommandJob(job, expireTimeMs);
+  await waitForCommandJob(job, expireTimeMs, signal);
   return commandJobPayload(job);
 }
 
@@ -1562,7 +1596,12 @@ async function runFsEditTool(args: JsonObject, config: RuntimeConfig, target: Re
   });
 }
 
-async function runScriptTool(args: JsonObject, config: RuntimeConfig, target: ResolvedSshTarget): Promise<JsonObject> {
+async function runScriptTool(
+  args: JsonObject,
+  config: RuntimeConfig,
+  target: ResolvedSshTarget,
+  signal?: AbortSignal,
+): Promise<JsonObject> {
   const elevate = optionalBoolean(args.elevate, "elevate") ?? false;
   assertRemoteElevationAllowed(elevate, target, config);
   const timeoutMs = parseDurationArg(args.timeout_ms, config.execKillTimeMs, "timeout_ms");
@@ -1596,7 +1635,7 @@ async function runScriptTool(args: JsonObject, config: RuntimeConfig, target: Re
       ? (jobId) => wrapSudoRemoteCommand(buildManagedRemoteCancelCommand(jobId), config.sudoPassword)
       : undefined,
   );
-  await waitForCommandJob(job, expireTimeMs);
+  await waitForCommandJob(job, expireTimeMs, signal);
   return commandJobPayload(job);
 }
 
@@ -2123,16 +2162,22 @@ function healthPayload(config: RuntimeConfig): JsonObject {
   };
 }
 
-async function invokeTool(name: string, args: JsonObject, sessionId: string, config: RuntimeConfig): Promise<JsonObject> {
+async function invokeTool(
+  name: string,
+  args: JsonObject,
+  sessionId: string,
+  config: RuntimeConfig,
+  signal?: AbortSignal,
+): Promise<JsonObject> {
   const targetTools = new Set(["exec", "sudo-exec", "fs-read", "fs-write", "fs-edit", "run-script"]);
   if (targetTools.has(name)) {
     const target = resolveSshTarget(args, config);
     await auditToolCall(name, commandAuditArgs(args, target), sessionId, config);
-    if (name === "exec" || name === "sudo-exec") return runSshTool(name, args, config, target);
+    if (name === "exec" || name === "sudo-exec") return runSshTool(name, args, config, target, signal);
     if (name === "fs-read") return runFsReadTool(args, config, target);
     if (name === "fs-write") return runFsWriteTool(args, config, target);
     if (name === "fs-edit") return runFsEditTool(args, config, target);
-    return runScriptTool(args, config, target);
+    return runScriptTool(args, config, target, signal);
   }
   await auditToolCall(name, args, sessionId, config);
   if (name === "health") return healthPayload(config);
@@ -2245,8 +2290,26 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse, config: Runt
       return;
     }
 
+    // If the client disconnects (MetaMCP abort / proxy close), cancel the remote
+    // process group instead of leaving an orphan command running.
+    const disconnect = new AbortController();
+    const onClientGone = () => {
+      if (!disconnect.signal.aborted) disconnect.abort();
+    };
+    req.once("aborted", onClientGone);
+    req.once("close", () => {
+      if (!res.writableEnded) onClientGone();
+    });
+    res.once("close", () => {
+      if (!res.writableEnded) onClientGone();
+    });
+
     try {
-      const structuredContent = await invokeTool(name, args, sessionId, config);
+      const structuredContent = await invokeTool(name, args, sessionId, config, disconnect.signal);
+      if (disconnect.signal.aborted) {
+        // Client is gone; skip writing a response body.
+        return;
+      }
       sendJson(
         res,
         200,
@@ -2257,6 +2320,7 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse, config: Runt
         headers,
       );
     } catch (error) {
+      if (disconnect.signal.aborted) return;
       const message = error instanceof Error ? error.message : "Tool call failed";
       const code =
         error instanceof RemoteToolError
@@ -2609,5 +2673,5 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   void main();
 }
 
-export { loadRuntimeConfig, listTools, healthPayload, invokeTool };
+export { loadRuntimeConfig, listTools, healthPayload, invokeTool, handleMcp };
 

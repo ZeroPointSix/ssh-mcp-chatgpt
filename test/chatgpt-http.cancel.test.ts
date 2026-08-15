@@ -1,5 +1,6 @@
+import { createServer, request as httpRequest } from 'node:http';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { invokeTool, loadRuntimeConfig } from '../src/chatgpt-http';
+import { handleMcp, invokeTool, loadRuntimeConfig } from '../src/chatgpt-http';
 
 const mockState = vi.hoisted(() => ({
   commands: [] as string[],
@@ -381,5 +382,81 @@ describe('exec-cancel remote process-group control', () => {
     expect(terminal.status).toBe('completed');
     expect(terminal.exit_code).toBe(0);
     expect(terminal.stdout).toBe('');
+  });
+
+  it('cancels the remote process group when the HTTP client disconnects mid-wait', async () => {
+    configureSshTarget();
+    mockState.stopCloseOnEnd = true;
+    const config = loadRuntimeConfig();
+    const server = createServer((req, res) => {
+      void handleMcp(req, res, config);
+    });
+
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const address = server.address();
+      if (!address || typeof address === 'string') {
+        throw new Error('HTTP test server did not expose a TCP port');
+      }
+
+      const body = JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: {
+          name: 'exec',
+          arguments: {
+            command: 'sleep 60',
+            expire_time_ms: 60000,
+            kill_time_ms: 60000,
+            note: 'client disconnect cancel',
+          },
+        },
+      });
+      const request = httpRequest({
+        host: '127.0.0.1',
+        port: address.port,
+        path: '/mcp',
+        method: 'POST',
+        headers: {
+          accept: 'application/json, text/event-stream',
+          'content-type': 'application/json',
+          'content-length': Buffer.byteLength(body),
+        },
+      });
+      request.on('error', () => {
+        // Destroying the client socket is the behavior under test.
+      });
+      request.end(body);
+
+      for (let attempt = 0; attempt < 100 && !mockState.commandStream; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 2));
+      }
+      expect(mockState.commandStream).toBeDefined();
+
+      request.destroy();
+
+      for (let attempt = 0; attempt < 100 && mockState.commands.length < 2; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 2));
+      }
+      expect(
+        mockState.commands.some(
+          (command) => command.includes('kill -TERM') && command.includes('kill -KILL'),
+        ),
+      ).toBe(true);
+
+      const jobId = mockState.commands[0]?.match(/job-[A-Za-z0-9_-]+/)?.[0];
+      expect(jobId).toBeDefined();
+      const terminal = await invokeTool(
+        'exec-status',
+        { job_id: jobId, note: 'confirm disconnect cancellation' },
+        'test-session',
+        config,
+      );
+      expect(terminal.status).toBe('cancelled');
+      expect(terminal.stop_signal_sent).toBe(true);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 });
