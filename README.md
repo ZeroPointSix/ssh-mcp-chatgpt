@@ -20,7 +20,7 @@ It keeps the existing stdio CLI for local MCP clients and adds a remote HTTP ent
 | `health` | Returns non-secret service status and deployment capabilities. |
 | `list-profiles` | Lists read-only, non-secret SSH profile IDs, labels, default state, and sudo availability. |
 | `exec` | Executes a shell command on a server-side configured SSH profile. Long commands return a `job_id` after `expire_time_ms` and keep running in the background. |
-| `sudo-exec` | Executes a shell command through sudo when enabled globally and for the selected profile, with the same background job behavior. |
+| `sudo-exec` | Optional. Hidden from `tools/list` when `SSH_MCP_DISABLE_SUDO=1`. Otherwise executes a shell command through sudo when the selected profile also has sudo enabled, with the same background job behavior. |
 | `exec-status` | Polls exit status and progress for a background `job_id`. Supports `include_output=false` and `since_stdout_offset` / `since_stderr_offset` for cheap or incremental polls. |
 | `exec-cancel` | Requests cancellation for a running background `job_id`; poll `exec-status` until the final status is confirmed. |
 | `fs-read` | Reads a remote text file with numbered lines, pagination, SHA-256, allowed-root checks, and an 8 MiB preflight limit. |
@@ -28,7 +28,9 @@ It keeps the existing stdio CLI for local MCP clients and adds a remote HTTP ent
 | `fs-edit` | Replaces one exact match or all exact matches while preserving the existing file mode and ownership. |
 | `run-script` | Runs Bash, sh, Python, or Node scripts with syntax checks, arguments, environment values, stdin, timeouts, and cleanup. |
 
-SSH targets are intentionally server-side configuration. ChatGPT should not choose arbitrary hosts or receive raw credentials from a user prompt. Use `list-profiles` to discover configured profile IDs and pass `target_id` to `exec` or `sudo-exec`. If a default profile is configured, `target_id` may be omitted; otherwise the tool returns a clear missing-target error. Profiles are read-only at runtime and there are no profile CRUD tools.
+`sudo-exec` is omitted from `tools/list` when `SSH_MCP_DISABLE_SUDO=1` (the production example below). The current MetaMCP `VPS` namespace (live `tools/list` on 2026-09-10) exposes nine tools and does **not** include `sudo-exec`. Use `list-profiles` / `health` to see whether sudo is available; do not assume this table is the live tool list.
+
+SSH targets are intentionally server-side configuration. ChatGPT should not choose arbitrary hosts or receive raw credentials from a user prompt. Use `list-profiles` to discover configured profile IDs and pass `target_id` to `exec` (and to `sudo-exec` only when that tool is listed). If a default profile is configured, `target_id` may be omitted; otherwise the tool returns a clear missing-target error. Profiles are read-only at runtime and there are no profile CRUD tools.
 
 `exec` and `sudo-exec` accept one line. Use `run-script` for multiline scripts, heredocs, loops, and conditional logic. Use the file tools instead of shell redirection for file changes. Set `SSH_MCP_FS_ALLOWED_ROOTS` to a comma-separated list of absolute roots so file and script paths stay within approved directories.
 
