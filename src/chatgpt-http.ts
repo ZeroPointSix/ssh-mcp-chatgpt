@@ -29,7 +29,7 @@ type JsonRpcId = string | number | null;
 type JsonObject = Record<string, unknown>;
 
 const SERVER_NAME = "ssh-mcp-chatgpt";
-const SERVER_VERSION = "1.6.9-chatgpt.0";
+const SERVER_VERSION = "1.6.11-chatgpt.0";
 const STREAMABLE_HTTP_ACCEPT = "application/json, text/event-stream";
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const CODE_TTL_MS = 5 * 60 * 1000;
@@ -1121,7 +1121,9 @@ function startRemoteCommandStop(job: CommandJob): void {
       stream.end();
     });
   });
-  stopConnection.once("error", (error: Error) => {
+  // ssh2 may emit more than one error while a failed handshake is being torn
+  // down. Keep a listener for the whole client lifetime; fail() is idempotent.
+  stopConnection.on("error", (error: Error) => {
     fail("SSH cancellation connection error: " + redactSshConnectionError(error.message));
   });
   stopConnection.once("close", () => {
