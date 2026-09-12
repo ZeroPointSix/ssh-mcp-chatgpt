@@ -5,6 +5,7 @@ const mockState = vi.hoisted(() => ({
   commands: [] as string[],
   commandStream: undefined as any,
   commandClient: undefined as any,
+  stopClient: undefined as any,
   commandCallbackDelayMs: 0,
   commandCallbackNever: false,
   stopDelayMs: 0,
@@ -37,6 +38,7 @@ vi.mock('ssh2', async () => {
       const dispatchCallback = () => {
         callback(undefined, stream);
         if (command.includes('kill -KILL --')) {
+          mockState.stopClient = this;
           if (!mockState.stopCloseOnEnd) {
             const event = mockState.stopExitOnly ? 'exit' : 'close';
             setTimeout(() => stream.emit(event, 0, null), mockState.stopDelayMs);
@@ -77,6 +79,7 @@ afterEach(() => {
   mockState.commands.length = 0;
   mockState.commandStream = undefined;
   mockState.commandClient = undefined;
+  mockState.stopClient = undefined;
   mockState.commandCallbackDelayMs = 0;
   mockState.commandCallbackNever = false;
   mockState.stopDelayMs = 0;
@@ -137,6 +140,41 @@ describe('exec-cancel remote process-group control', () => {
     expect(mockState.commands[1]).toContain(started.job_id + '.pid');
     expect(mockState.commands[1]).toContain('kill -TERM');
     expect(mockState.commands[1]).toContain('kill -KILL');
+  });
+
+  it('absorbs repeated SSH errors while a failed cancellation connection is torn down', async () => {
+    configureSshTarget();
+    mockState.stopDelayMs = 60;
+    const config = loadRuntimeConfig();
+    const started = await invokeTool(
+      'exec',
+      { command: 'sleep 60', expire_time_ms: 10, kill_time_ms: 60000, note: 'start erroring-helper command' },
+      'test-session',
+      config,
+    );
+
+    await invokeTool(
+      'exec-cancel',
+      { job_id: started.job_id, note: 'cancel with repeated helper errors' },
+      'test-session',
+      config,
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(mockState.stopClient).toBeDefined();
+    expect(() => {
+      mockState.stopClient.emit('error', new Error('Connection lost before handshake'));
+      mockState.stopClient.emit('error', new Error('Connection lost during teardown'));
+    }).not.toThrow();
+
+    const pending = await invokeTool(
+      'exec-status',
+      { job_id: started.job_id, note: 'confirm repeated helper error handling' },
+      'test-session',
+      config,
+    );
+    expect(pending.status).toBe('cancelling');
+    expect(pending.stop_error).toContain('Connection lost before handshake');
   });
 
   it('waits for the exec callback before starting the cancellation helper', async () => {
