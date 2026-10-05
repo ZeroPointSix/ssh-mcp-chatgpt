@@ -77,6 +77,10 @@ export function sanitizeCommandWithMaxChars(command: string, maxChars: number): 
     throw new McpError(ErrorCode.InvalidParams, 'Command must be a string');
   }
 
+  if (command.includes('\0')) {
+    throw new McpError(ErrorCode.InvalidParams, 'Command cannot contain NUL characters');
+  }
+
   const trimmedCommand = command.trim();
   if (!trimmedCommand) {
     throw new McpError(ErrorCode.InvalidParams, 'Command cannot be empty');
@@ -346,7 +350,7 @@ let connectionManager: SSHConnectionManager | null = null;
 
 const server = new McpServer({
   name: 'SSH MCP Server',
-  version: '1.6.8',
+  version: '1.6.10',
   capabilities: {
     resources: {},
     tools: {},
